@@ -1,9 +1,4 @@
-//! Phase 5: Low-Latency Streaming Completion Server
-//!
-//! An asynchronous completion server using axum and tokio.
-//! Exposes a single POST endpoint `/v1/autocomplete` with:
-//!   - 150ms request debouncer using CancellationToken
-//!   - SSE streaming of completion chunks
+//! Low-latency HTTP/SSE server for token-budgeted code retrieval.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +8,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -22,67 +17,99 @@ use tracing::{debug, info, warn};
 use crate::asg::{Asg, SharedAsg};
 use crate::ast::{AstChunker, MerkleTree, TrigramIndex};
 use crate::compressor::ChunkRegistry;
+use crate::config::TokenSaverConfig;
 use crate::search::SearchEngine;
 use crate::tracker::{ContextTracker, CursorPayload};
 
 // ---------------------------------------------------------------------------
-// Request / Response Types
+// API types
 // ---------------------------------------------------------------------------
 
-/// Request body for the autocomplete endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutocompleteRequest {
-    /// The file path being edited.
     pub file_path: String,
-    /// Cursor line (0-indexed).
     pub line: usize,
-    /// Cursor column (0-indexed).
     pub column: usize,
-    /// The partial text / query to complete.
     pub query: String,
-    /// Optional request ID for tracing.
     pub request_id: Option<String>,
 }
 
-/// A single SSE chunk in the streaming response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionChunk {
-    /// The completion text for this chunk.
     pub text: String,
-    /// Whether this is the final chunk.
     pub done: bool,
-    /// The node ID this chunk is based on, if any.
     pub node_id: Option<usize>,
-    /// The PageRank score of the source node.
     pub pagerank: Option<f64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchRequest {
+    pub query: String,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    pub context_node_id: Option<usize>,
+}
+
+fn default_top_k() -> usize {
+    10
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchHit {
+    pub node_id: usize,
+    pub tracker_id: String,
+    pub name: String,
+    pub kind: String,
+    pub file_path: String,
+    pub pagerank: f64,
+    pub rrf_score: f64,
+    pub scores: HashMap<&'static str, f64>,
+    pub rrf_contributions: HashMap<&'static str, f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResponse {
+    pub query: String,
+    pub hits: Vec<SearchHit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub workspace: String,
+    pub asg_nodes: usize,
+    pub asg_edges: usize,
+    pub compressed_chunks: usize,
+    pub ast_chunks: usize,
+    pub merkle_root: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
-// Server State
+// Shared state
 // ---------------------------------------------------------------------------
 
-/// Shared application state for the completion server.
+#[derive(Clone)]
+pub struct ActiveRequest {
+    generation: u64,
+    token: CancellationToken,
+}
+
 #[derive(Clone)]
 pub struct ServerState {
-    /// The ASG wrapped in a shared handle.
     pub asg: SharedAsg,
-    /// The chunk registry for compressed source.
     pub registry: Arc<ChunkRegistry>,
-    /// The search engine for RRF retrieval.
     pub search_engine: Arc<SearchEngine>,
-    /// The context tracker for cursor mapping.
     pub tracker: Arc<ContextTracker>,
-    /// Local trigram index over AST chunks (lexical/hybrid search pillar).
     pub ast_trigram: Arc<TrigramIndex>,
-    /// Merkle tree fingerprint of the indexed workspace (change detection).
     pub ast_merkle: Arc<MerkleTree>,
-    /// Active request cancellation tokens, keyed by file_path.
-    pub active_requests: Arc<tokio::sync::Mutex<HashMap<String, CancellationToken>>>,
-    /// Monotonic request-id counter.
+    pub active_requests: Arc<tokio::sync::Mutex<HashMap<String, ActiveRequest>>>,
     pub request_counter: Arc<AtomicU64>,
+    pub workspace: Arc<std::path::PathBuf>,
+    pub debounce_ms: u64,
 }
 
 impl ServerState {
+    /// Backwards-compatible state constructor using default runtime settings.
     pub fn new(
         asg: Asg,
         registry: ChunkRegistry,
@@ -90,11 +117,35 @@ impl ServerState {
         ast_trigram: TrigramIndex,
         ast_merkle: MerkleTree,
     ) -> Self {
+        let config = TokenSaverConfig::default();
+        let workspace = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        Self::with_config(
+            asg,
+            registry,
+            search_engine,
+            ast_trigram,
+            ast_merkle,
+            workspace,
+            &config,
+        )
+    }
+
+    pub fn with_config(
+        asg: Asg,
+        registry: ChunkRegistry,
+        search_engine: SearchEngine,
+        ast_trigram: TrigramIndex,
+        ast_merkle: MerkleTree,
+        workspace: std::path::PathBuf,
+        config: &TokenSaverConfig,
+    ) -> Self {
         let shared_asg = SharedAsg::new(asg);
-        let tracker = Arc::new(ContextTracker::new(
+        let tracker = Arc::new(ContextTracker::with_config(
             shared_asg.clone(),
             registry.clone(),
             search_engine.clone(),
+            workspace.clone(),
+            config.context.clone(),
         ));
 
         Self {
@@ -106,61 +157,63 @@ impl ServerState {
             ast_merkle: Arc::new(ast_merkle),
             active_requests: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
+            workspace: Arc::new(workspace),
+            debounce_ms: config.debounce_ms,
         }
     }
 
-    /// Allocate the next monotonic request ID.
     pub fn next_request_id(&self) -> u64 {
         self.request_counter.fetch_add(1, Ordering::Relaxed)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Debouncer
+// Generation-safe debouncing
 // ---------------------------------------------------------------------------
 
-/// Debounces incoming requests by file path.
-/// If a request for the same file is already in-flight, it is cancelled
-/// and replaced with the new one. The 150ms delay ensures we only process
-/// the latest keystroke.
+/// Debounces by file path. A generation number prevents an older cancelled
+/// request from unregistering the newer request that replaced it.
 pub struct RequestDebouncer {
-    active_requests: Arc<tokio::sync::Mutex<HashMap<String, CancellationToken>>>,
+    active_requests: Arc<tokio::sync::Mutex<HashMap<String, ActiveRequest>>>,
 }
 
 impl RequestDebouncer {
     pub fn new(
-        active_requests: Arc<tokio::sync::Mutex<HashMap<String, CancellationToken>>>,
+        active_requests: Arc<tokio::sync::Mutex<HashMap<String, ActiveRequest>>>,
     ) -> Self {
         Self { active_requests }
     }
 
-    /// Register a new request, cancelling any previous request for the same file.
-    /// Returns a CancellationToken that will be cancelled if a newer request arrives.
-    pub async fn register(&self, file_path: &str) -> CancellationToken {
+    pub async fn register(&self, file_path: &str, generation: u64) -> CancellationToken {
         let token = CancellationToken::new();
+        let active = ActiveRequest {
+            generation,
+            token: token.clone(),
+        };
         let mut requests = self.active_requests.lock().await;
-        if let Some(old_token) = requests.insert(file_path.to_string(), token.clone()) {
-            old_token.cancel();
-            debug!("Cancelled previous request for {}", file_path);
+        if let Some(previous) = requests.insert(file_path.to_string(), active) {
+            previous.token.cancel();
+            debug!("cancelled previous request for {file_path}");
         }
         token
     }
 
-    /// Unregister a request after it completes.
-    pub async fn unregister(&self, file_path: &str) {
+    pub async fn unregister(&self, file_path: &str, generation: u64) {
         let mut requests = self.active_requests.lock().await;
-        requests.remove(file_path);
+        if requests
+            .get(file_path)
+            .map(|active| active.generation == generation)
+            .unwrap_or(false)
+        {
+            requests.remove(file_path);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// SSE Streaming Response
+// SSE response
 // ---------------------------------------------------------------------------
 
-/// A streaming SSE response that yields completion chunks.
-///
-/// The receiver side of the mpsc channel is turned into a `Stream` of
-/// `text/event-stream` frames, then wrapped in an `axum::body::Body`.
 pub struct SseStream {
     rx: tokio::sync::mpsc::Receiver<CompletionChunk>,
 }
@@ -173,27 +226,30 @@ impl SseStream {
 
 impl IntoResponse for SseStream {
     fn into_response(self) -> Response {
-        let stream = futures::stream::unfold(self.rx, |mut rx| async move {
+        // The boolean ensures channel closure emits exactly one final event.
+        // The old stream yielded a final event forever and never closed.
+        let stream = futures::stream::unfold((self.rx, false), |(mut rx, finished)| async move {
+            if finished {
+                return None;
+            }
             match rx.recv().await {
                 Some(chunk) => {
+                    let is_done = chunk.done;
                     let json = serde_json::to_string(&chunk).unwrap_or_default();
                     let frame = format!("data: {json}\n\n");
                     Some((
                         Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(frame)),
-                        rx,
+                        (rx, is_done),
                     ))
                 }
-                // Channel closed: emit a final `done` event and end the stream.
-                None => {
-                    let final_frame = axum::body::Bytes::from(
+                None => Some((
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
                         "data: {\"text\":\"\",\"done\":true,\"node_id\":null,\"pagerank\":null}\n\n",
-                    );
-                    Some((Ok::<_, std::convert::Infallible>(final_frame), rx))
-                }
+                    )),
+                    (rx, true),
+                )),
             }
         });
-
-        let body = axum::body::Body::from_stream(stream);
 
         Response::builder()
             .status(StatusCode::OK)
@@ -201,130 +257,71 @@ impl IntoResponse for SseStream {
             .header("Cache-Control", "no-cache")
             .header("Connection", "keep-alive")
             .header("X-Accel-Buffering", "no")
-            .body(body)
+            .body(axum::body::Body::from_stream(stream))
             .expect("valid SSE response")
     }
 }
 
 // ---------------------------------------------------------------------------
-// Handler
+// Handlers
 // ---------------------------------------------------------------------------
 
-/// POST /v1/autocomplete handler.
-///
-/// Debounces overlapping keystroke requests (150ms settle window), then streams
-/// the assembled completion context chunk-by-chunk over SSE.
 pub async fn autocomplete_handler(
     State(state): State<ServerState>,
-    Json(req): Json<AutocompleteRequest>,
+    Json(request): Json<AutocompleteRequest>,
 ) -> Response {
-    let request_id = req
+    let generation = state.next_request_id();
+    let request_id = request
         .request_id
         .clone()
-        .unwrap_or_else(|| format!("req-{}", state.next_request_id()));
-
+        .unwrap_or_else(|| format!("req-{generation}"));
     info!(
-        "Received autocomplete request {} for {}:{}:{}",
-        request_id, req.file_path, req.line, req.column
+        "autocomplete {request_id} for {}:{}:{}",
+        request.file_path, request.line, request.column
     );
 
-    // Debounce: cancel any in-flight request for this file.
     let debouncer = RequestDebouncer::new(state.active_requests.clone());
-    let cancel_token = debouncer.register(&req.file_path).await;
-
-    // Wait 150ms; a newer keystroke for the same file cancels this token and
-    // drops this request.
-    let watch_token = cancel_token.clone();
+    let cancel_token = debouncer
+        .register(&request.file_path, generation)
+        .await;
     let proceed = tokio::select! {
-        _ = tokio::time::sleep(Duration::from_millis(150)) => true,
-        _ = watch_token.cancelled() => false,
+        _ = tokio::time::sleep(Duration::from_millis(state.debounce_ms)) => true,
+        _ = cancel_token.cancelled() => false,
     };
-
     if !proceed {
-        debug!("Request {} cancelled by a newer keystroke", request_id);
-        debouncer.unregister(&req.file_path).await;
+        debouncer.unregister(&request.file_path, generation).await;
         return (StatusCode::OK, "cancelled").into_response();
     }
 
-    // Build the cursor payload and locate the node under the cursor.
-    let cursor = CursorPayload::new(&req.file_path, req.line, req.column);
+    let cursor = CursorPayload::new(&request.file_path, request.line, request.column);
     let node_id = state.tracker.find_node_at_cursor(&cursor);
-    let (node_name, pagerank) = match node_id.and_then(|id| state.asg.get_node(id)) {
-        Some(node) => (Some(node.name.clone()), Some(node.pagerank)),
-        None => (None, None),
-    };
+    let (node_name, tracker_id, pagerank) = node_id
+        .and_then(|id| state.asg.get_node(id))
+        .map(|node| {
+            (
+                Some(node.name.clone()),
+                Some(node.tracker_id.clone()),
+                Some(node.pagerank),
+            )
+        })
+        .unwrap_or((None, None, None));
 
-    debug!(
-        "Cursor at node {:?} (name: {:?}, pagerank: {:?})",
-        node_id, node_name, pagerank
-    );
-
-    // Channel over which completion chunks are streamed.
     let (tx, rx) = tokio::sync::mpsc::channel::<CompletionChunk>(32);
-
-    // Spawn the completion assembly task; it can be dropped (tx closed) if the
-    // client disconnects.
-    let state = state.clone();
-    let cursor = cursor.clone();
-    let query = req.query.clone();
+    let task_state = state.clone();
+    let task_file = request.file_path.clone();
+    let query = request.query.clone();
     let task_token = cancel_token.clone();
-    let task_id = request_id.clone();
 
     tokio::spawn(async move {
-        // Chunk 1: a small header identifying the node under the cursor.
-        if tx
-            .send(CompletionChunk {
-                text: format!(
-                    "// node: {} (pagerank: {:.6})\n",
-                    node_name.clone().unwrap_or_default(),
-                    pagerank.unwrap_or(0.0)
-                ),
-                done: false,
-                node_id,
-                pagerank,
-            })
-            .await
-            .is_err()
-        {
-            return; // Client disconnected.
-        }
-
-        // Chunk 2: raw (uncompressed) 20-line surrounding context.
-        let surrounding = state.tracker.get_surrounding_lines(&cursor);
-        if tx
-            .send(CompletionChunk {
-                text: format!("{surrounding}\n"),
-                done: false,
-                node_id,
-                pagerank,
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-
-        // Chunks 3..N: top-3 compressed dependency nodes in token-saver notation.
-        let deps = state
-            .tracker
-            .get_compressed_dependencies(&cursor, &query)
-            .await;
-
-        for (i, dep) in deps.iter().enumerate() {
-            if task_token.is_cancelled() {
-                warn!("Completion task {} cancelled by a newer request", task_id);
-                break;
-            }
-
-            let header = match i {
-                0 => "// --- Compressed Dependency (top 1) ---\n",
-                1 => "// --- Compressed Dependency (top 2) ---\n",
-                _ => "// --- Compressed Dependency (top 3) ---\n",
-            };
-
+        let stream_work = async {
+            let header_name = tracker_id.or(node_name).unwrap_or_default();
             if tx
                 .send(CompletionChunk {
-                    text: format!("{header}{dep}\n"),
+                    text: format!(
+                        "// node: {} (pagerank: {:.6})\n",
+                        header_name,
+                        pagerank.unwrap_or(0.0)
+                    ),
                     done: false,
                     node_id,
                     pagerank,
@@ -335,78 +332,175 @@ pub async fn autocomplete_handler(
                 return;
             }
 
-            // Small inter-chunk delay for a natural streaming cadence.
-            tokio::time::sleep(Duration::from_millis(8)).await;
-        }
+            let surrounding = task_state.tracker.get_surrounding_lines(&cursor);
+            if tx
+                .send(CompletionChunk {
+                    text: format!("{surrounding}\n"),
+                    done: false,
+                    node_id,
+                    pagerank,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
 
-        // Final chunk.
-        let _ = tx
-            .send(CompletionChunk {
-                text: String::new(),
-                done: true,
-                node_id,
-                pagerank,
-            })
+            let dependencies = task_state
+                .tracker
+                .get_compressed_dependencies(&cursor, &query)
+                .await;
+            for (index, dependency) in dependencies.iter().enumerate() {
+                if task_token.is_cancelled() {
+                    warn!("autocomplete generation {generation} was cancelled");
+                    return;
+                }
+                if tx
+                    .send(CompletionChunk {
+                        text: format!(
+                            "// --- Compressed Dependency {} ---\n{}\n",
+                            index + 1,
+                            dependency
+                        ),
+                        done: false,
+                        node_id,
+                        pagerank,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            let _ = tx
+                .send(CompletionChunk {
+                    text: String::new(),
+                    done: true,
+                    node_id,
+                    pagerank,
+                })
+                .await;
+        };
+
+        stream_work.await;
+        RequestDebouncer::new(task_state.active_requests.clone())
+            .unregister(&task_file, generation)
             .await;
     });
-
-    // The streaming task holds its own copies of state; unregister this request
-    // so the next keystroke starts clean.
-    debouncer.unregister(&req.file_path).await;
 
     SseStream::new(rx).into_response()
 }
 
+pub async fn search_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<SearchRequest>,
+) -> impl IntoResponse {
+    let top_k = request.top_k.clamp(1, 100);
+    let results = state
+        .search_engine
+        .search_with_context(&request.query, top_k, request.context_node_id)
+        .await;
+    let hits = results
+        .into_iter()
+        .filter_map(|result| {
+            let node = state.asg.get_node(result.node_id)?;
+            Some(SearchHit {
+                node_id: node.id,
+                tracker_id: node.tracker_id.clone(),
+                name: node.name.clone(),
+                kind: node.kind.clone(),
+                file_path: node.file_path.display().to_string(),
+                pagerank: node.pagerank,
+                rrf_score: result.rrf_score,
+                scores: result.scores,
+                rrf_contributions: result.rrf_contributions,
+            })
+        })
+        .collect();
+    Json(SearchResponse {
+        query: request.query,
+        hits,
+    })
+}
+
+pub async fn health_handler(State(state): State<ServerState>) -> impl IntoResponse {
+    Json(HealthResponse {
+        status: "ok",
+        workspace: state.workspace.display().to_string(),
+        asg_nodes: state.asg.inner.nodes.len(),
+        asg_edges: state.asg.inner.edges.len(),
+        compressed_chunks: state.registry.chunks.len(),
+        ast_chunks: state.ast_trigram.len(),
+        merkle_root: state.ast_merkle.root_hash(),
+    })
+}
+
 // ---------------------------------------------------------------------------
-// Server Builder
+// Startup
 // ---------------------------------------------------------------------------
 
-/// Build and return the axum router for the completion server.
 pub fn build_router(state: ServerState) -> Router {
     Router::new()
+        .route("/health", get(health_handler))
+        .route("/v1/search", post(search_handler))
         .route("/v1/autocomplete", post(autocomplete_handler))
         .with_state(state)
 }
 
-/// Run the completion server on the given address.
 pub async fn run_server() -> anyhow::Result<()> {
-    info!("Starting Token-Saver completion server");
+    run_server_with_config(TokenSaverConfig::load()?).await
+}
 
-    // Build the ASG from the workspace source directory.
-    let workspace_dir = std::path::Path::new("/workspaces/Token-saver");
-    let asg = crate::asg::build_asg_from_dir(workspace_dir)?;
+pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<()> {
+    let workspace = config.canonical_workspace()?;
+    info!("indexing workspace {}", workspace.display());
 
-    // Build the lossless compressed chunk registry (Phase 2).
-    let mut chunk_compressor = crate::compressor::ChunkCompressor::new();
-    let registry = chunk_compressor.compress_asg(&asg);
+    let asg = crate::asg::build_asg_from_dir_with_config(
+        &workspace,
+        config.search.ppr.clone(),
+    )?;
+    info!("semantic ASG ready: {} nodes, {} edges", asg.nodes.len(), asg.edges.len());
 
-    // Build the multi-vector RRF search engine (Phase 3).
+    let mut compressor = crate::compressor::ChunkCompressor::new();
+    let registry = compressor.compress_asg(&asg);
+    let saved_bytes: usize = registry
+        .chunks
+        .iter()
+        .map(|entry| entry.value().bytes_saved())
+        .sum();
+    info!("compressed {} chunks ({} bytes saved)", registry.chunks.len(), saved_bytes);
+
     let shared_asg = SharedAsg::new(asg.clone());
-    let search_engine = SearchEngine::new(shared_asg.clone(), registry.clone());
+    let search_engine = SearchEngine::with_config(
+        shared_asg,
+        registry.clone(),
+        config.search.clone(),
+    );
     search_engine.precompute_embeddings().await;
 
-    // Build the Cursor-style AST index (Phase 6): chunk the workspace, build
-    // the Merkle fingerprint, and index trigrams for lexical/hybrid search.
-    let mut chunker = AstChunker::new()?;
-    let chunks = chunker.chunk_dir(workspace_dir)?;
+    let mut chunker = AstChunker::new()?.with_crate_root(&workspace);
+    let chunks = chunker.chunk_dir(&workspace)?;
     let ast_merkle = MerkleTree::build(&chunks);
     let mut ast_trigram = TrigramIndex::new(3);
     ast_trigram.index(&chunks);
     info!(
-        "AST index ready: {} chunks, {} trigram docs, merkle root {}",
+        "AST index ready: {} chunks, merkle {}",
         chunks.len(),
-        ast_trigram.len(),
         ast_merkle.root_hash().unwrap_or_default()
     );
 
-    // Assemble shared state and serve.
-    let state = ServerState::new(asg, registry, search_engine, ast_trigram, ast_merkle);
-    let app = build_router(state);
-
-    let addr = "0.0.0.0:8080";
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!("Listening on http://{addr}");
-
-    axum::serve(listener, app).await?;
+    let state = ServerState::with_config(
+        asg,
+        registry,
+        search_engine,
+        ast_trigram,
+        ast_merkle,
+        workspace,
+        &config,
+    );
+    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
+    info!("Token Saver listening on http://{}", config.bind);
+    axum::serve(listener, build_router(state)).await?;
     Ok(())
 }

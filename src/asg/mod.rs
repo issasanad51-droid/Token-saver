@@ -23,21 +23,22 @@ use std::sync::Arc;
 
 use tree_sitter::{Node as TsNode, Parser, Tree};
 
-use crate::compressor::ChunkRegistry;
-
 // ---------------------------------------------------------------------------
 // Core data structures
 // ---------------------------------------------------------------------------
 
 /// Edge kinds that connect ASG nodes semantically.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     /// A call-site node references a definition node.
     Calls,
     /// A node is contained within (owns) another node.
     Contains,
-    /// A node imports / references a symbol from another file.
+    /// A node imports a symbol from another file.
     Imports,
+    /// A node's signature or body references a type definition.
+    References,
     /// A node implements a trait or interface.
     Implements,
     /// A node is a field of a struct.
@@ -49,7 +50,10 @@ pub enum EdgeKind {
 /// A semantic node in the ASG.
 #[derive(Debug, Clone)]
 pub struct Node {
+    /// Dense runtime ID used by the low-latency retrieval path.
     pub id: usize,
+    /// Stable global ASG tracker (`crate::module::kind::name`).
+    pub tracker_id: String,
     pub name: String,
     pub kind: String,
     pub source: String,
@@ -96,10 +100,11 @@ pub enum AsgError {
 }
 
 // ---------------------------------------------------------------------------
-// ASG Builder
+// Historical full-AST builder (kept for API compatibility)
 // ---------------------------------------------------------------------------
 
-/// Builds an ASG from source files.
+/// Builds an ASG from source files. New workspace indexing uses the sparse v2
+/// builder through [`build_asg_from_dir`].
 pub struct AsgBuilder {
     parser: Parser,
     next_id: usize,
@@ -117,7 +122,7 @@ impl AsgBuilder {
         let rust_lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         parser
             .set_language(&rust_lang)
-            .map_err(|e| AsgError::ParseError(e.to_string()))?;
+            .map_err(|error| AsgError::ParseError(error.to_string()))?;
         Ok(Self {
             parser,
             next_id: 0,
@@ -130,158 +135,137 @@ impl AsgBuilder {
         })
     }
 
-    /// Parse a single source file and add its nodes/edges to the graph.
     pub fn parse_file(&mut self, path: &Path) -> Result<(), AsgError> {
         let source = std::fs::read_to_string(path)?;
         let tree = self
             .parser
-            .parse(&source.as_bytes(), None)
-            .ok_or_else(|| AsgError::ParseError(format!("Failed to parse {}", path.display())))?;
-
-        let file_path = path.to_path_buf();
-        self.walk_tree(tree.root_node(), &source, &file_path, None);
+            .parse(source.as_bytes(), None)
+            .ok_or_else(|| AsgError::ParseError(format!("failed to parse {}", path.display())))?;
+        self.walk_tree(tree, &source, path);
         Ok(())
     }
 
-    /// Recursively walk a tree-sitter node, creating ASG nodes and edges.
-    fn walk_tree(
+    fn walk_tree(&mut self, tree: Tree, source: &str, file_path: &Path) {
+        self.walk_node(tree.root_node(), source, file_path, None);
+    }
+
+    fn walk_node(
         &mut self,
         ts_node: TsNode,
         source: &str,
         file_path: &Path,
         parent_id: Option<usize>,
     ) {
-        let kind = ts_node.kind();
-        let node_source = ts_node
-            .utf8_text(source.as_bytes())
-            .unwrap_or("")
-            .to_string();
-
-        // Determine the node name from the first named child that is an identifier.
         let name = self.extract_name(ts_node, source);
-
         let id = self.next_id;
         self.next_id += 1;
+        let tracker_id = self.qualified_name(&name, file_path);
 
-        let node = Node {
+        self.nodes.push(Node {
             id,
+            tracker_id: tracker_id.clone(),
             name: name.clone(),
-            kind: kind.to_string(),
-            source: node_source.clone(),
+            kind: ts_node.kind().to_string(),
+            source: ts_node
+                .utf8_text(source.as_bytes())
+                .unwrap_or_default()
+                .to_string(),
             file_path: file_path.to_path_buf(),
             range: (ts_node.start_byte(), ts_node.end_byte()),
             pagerank: 0.0,
-        };
+        });
 
-        // Register in symbol table if it's a definition.
         if self.is_definition(ts_node) {
-            let qualified = self.qualified_name(&name, file_path);
-            self.symbol_table.insert(qualified, id);
+            self.symbol_table.insert(tracker_id, id);
         }
-
-        // Register in file index.
         self.file_index
             .entry(file_path.to_path_buf())
             .or_default()
             .push(id);
-
-        self.nodes.push(node);
-
-        // Create edge from parent.
-        if let Some(pid) = parent_id {
-            self.add_edge(pid, id, EdgeKind::Contains);
+        if let Some(parent) = parent_id {
+            self.add_edge(parent, id, EdgeKind::Contains);
         }
-
-        // Recurse into children.
-        for i in 0..ts_node.named_child_count() {
-            if let Some(child) = ts_node.named_child(i) {
-                self.walk_tree(child, source, file_path, Some(id));
+        for index in 0..ts_node.named_child_count() {
+            if let Some(child) = ts_node.named_child(index) {
+                self.walk_node(child, source, file_path, Some(id));
             }
         }
     }
 
-    /// Extract a human-readable name from a tree-sitter node.
     fn extract_name(&self, ts_node: TsNode, source: &str) -> String {
-        // Look for a child named "name" or an identifier.
-        for i in 0..ts_node.named_child_count() {
-            if let Some(child) = ts_node.named_child(i) {
-                if child.kind() == "identifier" || child.kind() == "type_identifier" {
+        if let Some(name) = ts_node.child_by_field_name("name") {
+            return name
+                .utf8_text(source.as_bytes())
+                .unwrap_or_default()
+                .to_string();
+        }
+        for index in 0..ts_node.named_child_count() {
+            if let Some(child) = ts_node.named_child(index) {
+                if matches!(child.kind(), "identifier" | "type_identifier") {
                     return child
                         .utf8_text(source.as_bytes())
-                        .unwrap_or("")
+                        .unwrap_or_default()
                         .to_string();
                 }
             }
         }
-        // Fallback: use the node kind.
         ts_node.kind().to_string()
     }
 
-    /// Check if a tree-sitter node represents a definition.
     fn is_definition(&self, ts_node: TsNode) -> bool {
         matches!(
             ts_node.kind(),
-            "function_definition"
-                | "struct_definition"
-                | "enum_definition"
-                | "impl_definition"
-                | "trait_definition"
-                | "type_alias"
-                | "let_declaration"
+            "function_item"
+                | "struct_item"
+                | "enum_item"
+                | "impl_item"
+                | "trait_item"
+                | "type_item"
+                | "const_item"
+                | "static_item"
+                | "macro_definition"
         )
     }
 
-    /// Build a qualified name for symbol resolution.
     fn qualified_name(&self, name: &str, file_path: &Path) -> String {
         let file_stem = file_path
             .file_stem()
-            .and_then(|s| s.to_str())
+            .and_then(|stem| stem.to_str())
             .unwrap_or("unknown");
-        format!("{}::{}", file_stem, name)
+        format!("{file_stem}::{name}")
     }
 
-    /// Add an edge to the graph.
     fn add_edge(&mut self, from: usize, to: usize, kind: EdgeKind) {
-        let edge_idx = self.edges.len();
+        let edge_index = self.edges.len();
         self.edges.push(Edge { from, to, kind });
-        self.adjacency.entry(from).or_default().push(edge_idx);
-        self.reverse_adjacency.entry(to).or_default().push(edge_idx);
+        self.adjacency.entry(from).or_default().push(edge_index);
+        self.reverse_adjacency
+            .entry(to)
+            .or_default()
+            .push(edge_index);
     }
 
-    /// Resolve cross-file symbol references (CALL -> DEFINITION).
     pub fn resolve_symbols(&mut self) {
-        // Collect all call sites (identifier nodes that are not definitions).
         let call_sites: Vec<(usize, String)> = self
             .nodes
             .iter()
-            .filter(|n| n.kind == "identifier" && !self.is_definition_kind(&n.kind))
-            .map(|n| (n.id, n.name.clone()))
+            .filter(|node| node.kind == "identifier")
+            .map(|node| (node.id, node.name.clone()))
             .collect();
 
         for (call_id, name) in call_sites {
-            // Try to find a matching definition in the symbol table.
-            for (qualified, def_id) in &self.symbol_table {
-                if qualified.ends_with(&format!("::{}", name)) {
-                    self.add_edge(call_id, *def_id, EdgeKind::Calls);
-                    break;
-                }
+            let suffix = format!("::{name}");
+            let target = self
+                .symbol_table
+                .iter()
+                .find(|(qualified, _)| qualified.ends_with(&suffix))
+                .map(|(_, definition_id)| *definition_id);
+            if let Some(definition_id) = target {
+                self.add_edge(call_id, definition_id, EdgeKind::Calls);
             }
         }
     }
 
-    fn is_definition_kind(&self, kind: &str) -> bool {
-        matches!(
-            kind,
-            "function_definition"
-                | "struct_definition"
-                | "enum_definition"
-                | "impl_definition"
-                | "trait_definition"
-                | "type_alias"
-        )
-    }
-
-    /// Build the final ASG.
     pub fn build(mut self) -> Asg {
         self.resolve_symbols();
         Asg {
@@ -296,104 +280,208 @@ impl AsgBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// PageRank Engine
+// Weighted Personalized PageRank Engine
 // ---------------------------------------------------------------------------
 
-/// Pure-Rust PageRank implementation using power iteration.
-pub struct PageRankEngine {
-    /// Damping factor (typically 0.85).
+/// Structural importance assigned to each semantic edge type.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PageRankEdgeWeights {
+    pub calls: f64,
+    pub references: f64,
+    pub contains: f64,
+    pub imports: f64,
+    pub implements: f64,
+    pub field_of: f64,
+    pub variant_of: f64,
+}
+
+impl Default for PageRankEdgeWeights {
+    fn default() -> Self {
+        Self {
+            calls: 1.0,
+            references: 0.7,
+            contains: 0.15,
+            imports: 0.5,
+            implements: 0.9,
+            field_of: 0.25,
+            variant_of: 0.25,
+        }
+    }
+}
+
+impl PageRankEdgeWeights {
+    fn for_kind(&self, kind: EdgeKind) -> f64 {
+        let weight = match kind {
+            EdgeKind::Calls => self.calls,
+            EdgeKind::References => self.references,
+            EdgeKind::Contains => self.contains,
+            EdgeKind::Imports => self.imports,
+            EdgeKind::Implements => self.implements,
+            EdgeKind::FieldOf => self.field_of,
+            EdgeKind::VariantOf => self.variant_of,
+        };
+        if weight.is_finite() {
+            weight.max(0.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Tunable weighted Personalized PageRank parameters used by both startup
+/// centrality and query-time structural retrieval.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PersonalizedPageRankConfig {
+    /// Damping factor. Invalid values are clamped into `[0, 0.99]`.
     pub damping: f64,
-    /// Convergence threshold.
+    /// L1 convergence threshold.
     pub epsilon: f64,
-    /// Maximum iterations.
+    /// Hard iteration cap.
     pub max_iterations: usize,
+    pub edge_weights: PageRankEdgeWeights,
+}
+
+impl Default for PersonalizedPageRankConfig {
+    fn default() -> Self {
+        Self {
+            damping: 0.85,
+            epsilon: 1e-8,
+            max_iterations: 100,
+            edge_weights: PageRankEdgeWeights::default(),
+        }
+    }
+}
+
+/// Pure-Rust, edge-weighted Personalized PageRank using two dense buffers.
+#[derive(Debug, Clone)]
+pub struct PageRankEngine {
+    pub config: PersonalizedPageRankConfig,
 }
 
 impl Default for PageRankEngine {
     fn default() -> Self {
-        Self {
-            damping: 0.85,
-            epsilon: 1e-6,
-            max_iterations: 100,
-        }
+        Self::from_config(PersonalizedPageRankConfig::default())
     }
 }
 
 impl PageRankEngine {
+    /// Backwards-compatible constructor for the original uniform engine.
     pub fn new(damping: f64, epsilon: f64, max_iterations: usize) -> Self {
-        Self {
+        Self::from_config(PersonalizedPageRankConfig {
             damping,
             epsilon,
             max_iterations,
+            ..PersonalizedPageRankConfig::default()
+        })
+    }
+
+    pub fn from_config(config: PersonalizedPageRankConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn run(&self, asg: &mut Asg) {
+        let scores = self.personalized_scores(asg, &[]);
+        for (node, score) in asg.nodes.iter_mut().zip(scores) {
+            node.pagerank = score;
         }
     }
 
-    /// Run PageRank over the ASG, updating each node's `pagerank` field.
-    pub fn run(&self, asg: &mut Asg) {
-        let n = asg.nodes.len();
-        if n == 0 {
-            return;
+    /// Compute weighted PPR without mutating the graph.
+    pub fn personalized_scores(&self, asg: &Asg, seeds: &[(usize, f64)]) -> Vec<f64> {
+        let node_count = asg.nodes.len();
+        if node_count == 0 {
+            return Vec::new();
         }
 
-        // Build transition matrix as adjacency lists with out-degrees.
-        let mut out_degree: Vec<usize> = vec![0; n];
+        let mut teleport = vec![0.0; node_count];
+        for &(id, weight) in seeds {
+            if id < node_count && weight.is_finite() && weight > 0.0 {
+                teleport[id] += weight;
+            }
+        }
+        let seed_mass: f64 = teleport.iter().sum();
+        if seed_mass > 0.0 {
+            for value in &mut teleport {
+                *value /= seed_mass;
+            }
+        } else {
+            teleport.fill(1.0 / node_count as f64);
+        }
+
+        let mut outgoing: Vec<Vec<(usize, f64)>> = vec![Vec::new(); node_count];
+        let mut out_weight = vec![0.0; node_count];
         for edge in &asg.edges {
-            out_degree[edge.from] += 1;
+            if edge.from >= node_count || edge.to >= node_count || edge.from == edge.to {
+                continue;
+            }
+            let weight = self.config.edge_weights.for_kind(edge.kind);
+            if weight > 0.0 {
+                outgoing[edge.from].push((edge.to, weight));
+                out_weight[edge.from] += weight;
+            }
         }
 
-        // Initialize PageRank uniformly.
-        let mut pagerank: Vec<f64> = vec![1.0 / n as f64; n];
-        let mut new_pagerank: Vec<f64> = vec![0.0; n];
+        let damping = if self.config.damping.is_finite() {
+            self.config.damping.clamp(0.0, 0.99)
+        } else {
+            0.85
+        };
+        let epsilon = if self.config.epsilon.is_finite() {
+            self.config.epsilon.max(1e-15)
+        } else {
+            1e-8
+        };
+        let max_iterations = self.config.max_iterations.max(1);
 
-        for _ in 0..self.max_iterations {
-            // Reset new values.
-            for val in new_pagerank.iter_mut() {
-                *val = (1.0 - self.damping) / n as f64;
-            }
+        let mut rank = teleport.clone();
+        let mut next = vec![0.0; node_count];
+        for _ in 0..max_iterations {
+            next.fill(0.0);
+            let mut dangling_mass = 0.0;
 
-            // Distribute PageRank along edges.
-            for edge in &asg.edges {
-                if out_degree[edge.from] > 0 {
-                    let contribution = self.damping * pagerank[edge.from] / out_degree[edge.from] as f64;
-                    new_pagerank[edge.to] += contribution;
+            for from in 0..node_count {
+                if out_weight[from] == 0.0 {
+                    dangling_mass += damping * rank[from];
+                    continue;
+                }
+                let scale = damping * rank[from] / out_weight[from];
+                for &(to, weight) in &outgoing[from] {
+                    next[to] += scale * weight;
                 }
             }
 
-            // Handle dangling nodes (no out-edges): distribute evenly.
-            for i in 0..n {
-                if out_degree[i] == 0 {
-                    new_pagerank[i] += self.damping * pagerank[i] / n as f64;
-                }
+            for index in 0..node_count {
+                next[index] += ((1.0 - damping) + dangling_mass) * teleport[index];
             }
 
-            // Check convergence.
-            let diff: f64 = pagerank
+            let difference: f64 = rank
                 .iter()
-                .zip(new_pagerank.iter())
-                .map(|(a, b)| (a - b).abs())
+                .zip(&next)
+                .map(|(old, new)| (old - new).abs())
                 .sum();
-
-            pagerank.clone_from_slice(&new_pagerank);
-
-            if diff < self.epsilon {
+            rank.copy_from_slice(&next);
+            if difference < epsilon {
                 break;
             }
         }
 
-        // Write back to nodes.
-        for (node, pr) in asg.nodes.iter_mut().zip(pagerank.iter()) {
-            node.pagerank = *pr;
+        let total: f64 = rank.iter().sum();
+        if total.is_finite() && total > 0.0 {
+            for score in &mut rank {
+                *score /= total;
+            }
         }
+        rank
     }
 }
 
 // ---------------------------------------------------------------------------
-// ASG Extension: Chunk Registry Integration
+// Runtime graph assembly
 // ---------------------------------------------------------------------------
 
-/// Trait for extracting functional chunks (functions, structs, impls) from an ASG.
 pub trait ChunkExtractor {
-    /// Returns node IDs that represent functional chunks.
     fn extract_chunks(&self) -> Vec<usize>;
 }
 
@@ -401,35 +489,134 @@ impl ChunkExtractor for Asg {
     fn extract_chunks(&self) -> Vec<usize> {
         self.nodes
             .iter()
-            .filter(|n| {
-                n.kind == "function_definition"
-                    || n.kind == "struct_definition"
-                    || n.kind == "impl_definition"
-                    || n.kind == "enum_definition"
-                    || n.kind == "trait_definition"
+            .filter(|node| {
+                matches!(
+                    node.kind.as_str(),
+                    "fn"
+                        | "struct"
+                        | "impl"
+                        | "enum"
+                        | "trait"
+                        | "type"
+                        | "const"
+                        | "static"
+                        | "macro"
+                        | "mod"
+                        | "function_item"
+                        | "struct_item"
+                        | "impl_item"
+                        | "enum_item"
+                        | "trait_item"
+                )
             })
-            .map(|n| n.id)
+            .map(|node| node.id)
             .collect()
     }
 }
 
-/// Build an ASG from a directory of Rust source files.
+/// Build the sparse semantic ASG used by the live retrieval pipeline.
 pub fn build_asg_from_dir(dir: &Path) -> Result<Asg, AsgError> {
-    let mut builder = AsgBuilder::new()?;
-    let mut files: Vec<PathBuf> = Vec::new();
+    build_asg_from_dir_with_config(dir, PersonalizedPageRankConfig::default())
+}
 
-    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(Result::ok) {
-        if entry.path().extension().map_or(false, |ext| ext == "rs") {
-            files.push(entry.path().to_path_buf());
+/// Build and rank an ASG with custom weighted-PPR settings.
+pub fn build_asg_from_dir_with_config(
+    dir: &Path,
+    pagerank: PersonalizedPageRankConfig,
+) -> Result<Asg, AsgError> {
+    let sources = source::SourceSet::from_dir(dir, "rs")?;
+    let mut semantic_builder = builder::AsgBuilder::new(&sources)?.with_crate_root(dir);
+    semantic_builder.parse()?;
+    let semantic = semantic_builder.build();
+    let mut runtime = runtime_graph(&semantic);
+    PageRankEngine::from_config(pagerank).run(&mut runtime);
+    Ok(runtime)
+}
+
+fn runtime_graph(graph: &graph::AsgGraph<'_>) -> Asg {
+    let mut runtime = Asg::default();
+    let mut dense_ids: HashMap<graph::NodeId, usize> = HashMap::new();
+
+    for data in graph.nodes() {
+        let id = runtime.nodes.len();
+        let name = data
+            .id
+            .as_str()
+            .rsplit("::")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let kind = node_type_label(data.node_type).to_string();
+        let file_path = data.file.clone().unwrap_or_default();
+
+        runtime.nodes.push(Node {
+            id,
+            tracker_id: data.id.to_string(),
+            name: name.clone(),
+            kind,
+            source: data.body.to_string(),
+            file_path: file_path.clone(),
+            range: data.range,
+            pagerank: data.pagerank_score,
+        });
+        dense_ids.insert(data.id.clone(), id);
+        runtime.file_index.entry(file_path).or_default().push(id);
+        runtime.symbol_table.insert(data.id.to_string(), id);
+        runtime.symbol_table.entry(name).or_insert(id);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for data in graph.nodes() {
+        let Some(&from) = dense_ids.get(&data.id) else {
+            continue;
+        };
+        for edge in graph.outgoing_edges(&data.id) {
+            let Some(&to) = dense_ids.get(&edge.node) else {
+                continue;
+            };
+            let kind = runtime_edge_kind(edge.kind);
+            if from == to || !seen.insert((from, to, kind)) {
+                continue;
+            }
+            let edge_index = runtime.edges.len();
+            runtime.edges.push(Edge { from, to, kind });
+            runtime.adjacency.entry(from).or_default().push(edge_index);
+            runtime
+                .reverse_adjacency
+                .entry(to)
+                .or_default()
+                .push(edge_index);
         }
     }
+    runtime
+}
 
-    files.sort();
-    for file in &files {
-        builder.parse_file(file)?;
+fn node_type_label(kind: graph::NodeType) -> &'static str {
+    match kind {
+        graph::NodeType::Struct => "struct",
+        graph::NodeType::Impl => "impl",
+        graph::NodeType::Fn => "fn",
+        graph::NodeType::Enum => "enum",
+        graph::NodeType::Macro => "macro",
+        graph::NodeType::Trait => "trait",
+        graph::NodeType::Mod => "mod",
+        graph::NodeType::Type => "type",
+        graph::NodeType::Const => "const",
+        graph::NodeType::Static => "static",
+        graph::NodeType::Use => "use",
     }
+}
 
-    Ok(builder.build())
+fn runtime_edge_kind(kind: graph::EdgeKind) -> EdgeKind {
+    match kind {
+        graph::EdgeKind::Calls => EdgeKind::Calls,
+        graph::EdgeKind::References => EdgeKind::References,
+        graph::EdgeKind::Contains => EdgeKind::Contains,
+        graph::EdgeKind::Imports => EdgeKind::Imports,
+        graph::EdgeKind::Implements => EdgeKind::Implements,
+        graph::EdgeKind::FieldOf => EdgeKind::FieldOf,
+        graph::EdgeKind::VariantOf => EdgeKind::VariantOf,
+    }
 }
 
 /// A shared, thread-safe ASG handle for concurrent access.
@@ -454,5 +641,66 @@ impl SharedAsg {
             .symbol_table
             .get(name)
             .and_then(|id| self.inner.nodes.get(*id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(id: usize, name: &str) -> Node {
+        Node {
+            id,
+            tracker_id: format!("crate::fn::{name}"),
+            name: name.to_string(),
+            kind: "fn".to_string(),
+            source: String::new(),
+            file_path: PathBuf::new(),
+            range: (0, 0),
+            pagerank: 0.0,
+        }
+    }
+
+    #[test]
+    fn weighted_ppr_prefers_call_edge_over_containment() {
+        let mut asg = Asg {
+            nodes: vec![node(0, "seed"), node(1, "called"), node(2, "contained")],
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::Calls,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::Contains,
+                },
+            ],
+            ..Asg::default()
+        };
+        let engine = PageRankEngine::default();
+        let scores = engine.personalized_scores(&asg, &[(0, 1.0)]);
+        assert!(scores[1] > scores[2]);
+
+        engine.run(&mut asg);
+        let total: f64 = asg.nodes.iter().map(|node| node.pagerank).sum();
+        assert!((total - 1.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn invalid_seed_and_numeric_config_are_safe() {
+        let asg = Asg {
+            nodes: vec![node(0, "only")],
+            ..Asg::default()
+        };
+        let engine = PageRankEngine::from_config(PersonalizedPageRankConfig {
+            damping: f64::NAN,
+            epsilon: f64::NAN,
+            max_iterations: 0,
+            ..PersonalizedPageRankConfig::default()
+        });
+        let scores = engine.personalized_scores(&asg, &[(99, 1.0), (0, f64::NAN)]);
+        assert_eq!(scores, vec![1.0]);
     }
 }

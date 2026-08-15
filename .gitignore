@@ -11,5 +11,8 @@
 # OS
 .DS_Store
 
+# Local runtime configuration (copy from the tracked example)
+/token-saver.yaml
+
 # Logs
 *.log

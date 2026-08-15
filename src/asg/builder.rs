@@ -214,7 +214,7 @@ impl<'a> AsgBuilder<'a> {
         parent: Option<NodeId>,
     ) {
         let Some(name) = field_text(node, "name", source) else { return };
-        let id = self.qualified_id(module, "fn", &name);
+        let id = self.scoped_id(module, parent.as_ref(), "fn", &name);
         self.insert_node(node, source, path, module, parent, id, NodeType::Fn);
     }
 
@@ -229,7 +229,7 @@ impl<'a> AsgBuilder<'a> {
         kind_label: &str,
     ) {
         let Some(name) = field_text(node, "name", source) else { return };
-        let id = self.qualified_id(module, kind_label, &name);
+        let id = self.scoped_id(module, parent.as_ref(), kind_label, &name);
         self.insert_node(node, source, path, module, parent, id, node_type);
     }
 
@@ -250,7 +250,8 @@ impl<'a> AsgBuilder<'a> {
             Some(t) => format!("{t}_for_{self_type}"),
             None => format!("for_{self_type}"),
         };
-        let id = self.qualified_id(module, "impl", &label);
+        let base_id = self.scoped_id(module, parent.as_ref(), "impl", &label);
+        let id = self.unique_id(base_id);
 
         self.insert_node(node, source, path, module, parent, id.clone(), NodeType::Impl);
 
@@ -282,7 +283,7 @@ impl<'a> AsgBuilder<'a> {
         // nodes, keeping the graph sparse and structural.
         let Some(body) = node.child_by_field_name("body") else { return };
 
-        let id = self.qualified_id(module, "mod", &name);
+        let id = self.scoped_id(module, parent.as_ref(), "mod", &name);
         self.insert_node(node, source, path, module, parent, id.clone(), NodeType::Mod);
 
         // Inline module: recurse with an extended module path.
@@ -312,11 +313,11 @@ impl<'a> AsgBuilder<'a> {
         let _ = self.graph.add_node(id.clone(), node_type, body);
         let _ = self.graph.attach_location(&id, path.to_path_buf(), range);
 
-        if let Some(p) = parent {
-            let _ = self.graph.add_edge(&p, &id, EdgeKind::Contains);
+        if let Some(p) = parent.as_ref() {
+            let _ = self.graph.add_edge(p, &id, EdgeKind::Contains);
         }
 
-        self.register_symbol(&id, module);
+        self.register_symbol(&id, module, parent.as_ref());
         self.collect_calls_and_refs(node, source, id.clone(), module);
     }
 
@@ -326,19 +327,69 @@ impl<'a> AsgBuilder<'a> {
         NodeId::qualified("crate", &strs, kind, name)
     }
 
-    fn register_symbol(&mut self, id: &NodeId, module: &[String]) {        let name = id
+    /// Include the lexical owner in nested item IDs. This prevents common
+    /// method names such as `new` from colliding across multiple impl blocks in
+    /// the same module.
+    fn scoped_id(
+        &self,
+        module: &[String],
+        parent: Option<&NodeId>,
+        kind: &str,
+        name: &str,
+    ) -> NodeId {
+        match parent {
+            Some(parent) => NodeId::new(format!("{}::{kind}::{name}", parent.as_str())),
+            None => self.qualified_id(module, kind, name),
+        }
+    }
+
+    /// Rust permits multiple inherent impl blocks for one type. Preserve the
+    /// compact base tracker for the first and deterministically number later
+    /// blocks rather than dropping them as duplicate nodes.
+    fn unique_id(&self, base: NodeId) -> NodeId {
+        if !self.graph.contains(&base) {
+            return base;
+        }
+        for suffix in 2usize.. {
+            let candidate = NodeId::new(format!("{}::block::{suffix}", base.as_str()));
+            if !self.graph.contains(&candidate) {
+                return candidate;
+            }
+        }
+        unreachable!("unbounded impl tracker suffix space")
+    }
+
+    fn register_symbol(&mut self, id: &NodeId, module: &[String], parent: Option<&NodeId>) {
+        let name = id
             .0
             .rsplit("::")
             .next()
             .unwrap_or("")
             .to_string();
-        self.symbols.insert(name.clone(), id.clone());
-        if module.is_empty() {
-            self.symbols.insert(name, id.clone());
-        } else {
-            let mut parts = module.to_vec();
-            parts.push(name);
-            self.symbols.insert(parts.join("::"), id.clone());
+
+        // Keep the first bare-name binding. A bare method such as `new` is
+        // inherently ambiguous; replacing it on every file made resolution
+        // depend on traversal order.
+        self.symbols.entry(name.clone()).or_insert_with(|| id.clone());
+
+        let mut parts = module.to_vec();
+        parts.push(name.clone());
+        self.symbols.entry(parts.join("::")).or_insert_with(|| id.clone());
+
+        // Methods also get a `Type::method` alias derived from their impl owner,
+        // allowing `AppState::new()` to resolve without a compiler type pass.
+        if let Some(parent) = parent {
+            if let Some(owner) = impl_owner(parent.as_str()) {
+                self.symbols
+                    .entry(format!("{owner}::{name}"))
+                    .or_insert_with(|| id.clone());
+                let mut qualified = module.to_vec();
+                qualified.push(owner);
+                qualified.push(name);
+                self.symbols
+                    .entry(qualified.join("::"))
+                    .or_insert_with(|| id.clone());
+            }
         }
     }
 
@@ -440,15 +491,24 @@ impl<'a> AsgBuilder<'a> {
     /// Resolve a name: try module-qualified keys (walking up the module chain),
     /// then fall back to a global bare-name match.
     fn resolve_name(&self, name: &str, module: &[String]) -> Option<NodeId> {
+        let normalized = normalize_symbol(name);
         for i in (0..=module.len()).rev() {
-            let mut parts = module[..i].to_vec();
-            parts.push(name.to_string());
-            let key = parts.join("::");
+            let prefix = module[..i].join("::");
+            let key = if prefix.is_empty() {
+                normalized.clone()
+            } else {
+                format!("{prefix}::{normalized}")
+            };
             if let Some(id) = self.symbols.get(&key) {
                 return Some(id.clone());
             }
         }
-        self.symbols.get(name).cloned()
+        self.symbols.get(&normalized).cloned().or_else(|| {
+            normalized
+                .rsplit("::")
+                .next()
+                .and_then(|bare| self.symbols.get(bare).cloned())
+        })
     }
 }
 
@@ -478,6 +538,34 @@ fn field_text(node: TsNode, field: &str, source: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Return the self type encoded in an impl tracker such as
+/// `crate::state::impl::for_AppState` or `...::impl::Display_for_AppState`.
+fn impl_owner(parent: &str) -> Option<String> {
+    let marker = "::impl::";
+    let label = parent
+        .rsplit_once(marker)?
+        .1
+        .split("::block::")
+        .next()
+        .unwrap_or_default();
+    let owner = label
+        .rsplit_once("_for_")
+        .map(|(_, owner)| owner)
+        .or_else(|| label.strip_prefix("for_"))?;
+    Some(normalize_symbol(owner))
+}
+
+/// Strip Rust path prefixes/generic arguments down to the stable symbol form
+/// used by the lightweight resolver.
+fn normalize_symbol(name: &str) -> String {
+    let no_generics = name.split('<').next().unwrap_or(name).trim();
+    no_generics
+        .trim_start_matches("crate::")
+        .trim_start_matches("self::")
+        .trim_start_matches("super::")
+        .replace(' ', "")
+}
+
 /// Extract the callable name from a call expression's `function` field.
 /// Handles `f()`, `a::b::f()`, `x.f()`, `f::<T>()`.
 fn callee_name(callee: TsNode, source: &str) -> Option<String> {
@@ -487,21 +575,14 @@ fn callee_name(callee: TsNode, source: &str) -> Option<String> {
             .child_by_field_name("field")
             .and_then(|n| n.utf8_text(source.as_bytes()).ok())
             .map(str::to_string),
-        "scoped_identifier" => {
-            let mut last = None;
-            for i in 0..callee.named_child_count() {
-                if let Some(c) = callee.named_child(i) {
-                    if c.kind() == "identifier" {
-                        last = c.utf8_text(source.as_bytes()).ok().map(str::to_string);
-                    }
-                }
-            }
-            last
-        }
+        "scoped_identifier" => callee
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(normalize_symbol),
         "generic_function" => callee
             .child_by_field_name("function")
             .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-            .map(str::to_string),
+            .map(normalize_symbol),
         _ => None,
     }
 }
@@ -580,9 +661,9 @@ impl AppState {
         let run_id = NodeId::qualified("crate", &["server", "handler"], "fn", "run");
         let app_state_id = NodeId::qualified("crate", &["server", "state"], "struct", "AppState");
         let db_id = NodeId::qualified("crate", &["server", "state"], "struct", "Database");
-        let new_id = NodeId::qualified("crate", &["server", "state"], "fn", "new");
         let serve_id = NodeId::qualified("crate", &["server", "service"], "fn", "serve");
         let impl_id = NodeId::qualified("crate", &["server", "state"], "impl", "for_AppState");
+        let new_id = NodeId::new(format!("{}::fn::new", impl_id.as_str()));
 
         // Entities exist with the expected global tracker ids.
         for id in [&main_id, &run_id, &app_state_id, &db_id, &new_id, &serve_id, &impl_id] {

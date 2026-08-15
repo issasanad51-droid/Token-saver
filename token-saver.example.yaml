@@ -1,0 +1,38 @@
+# Copy to token-saver.yaml or set TOKEN_SAVER_CONFIG=/path/to/file.yaml.
+workspace: .
+bind: 0.0.0.0:8080
+debounce_ms: 150
+
+search:
+  candidate_multiplier: 4
+  semantic_min_score: 0.03
+  bm25_k1: 1.5
+  bm25_b: 0.75
+  ppr_seed_candidates: 8
+  context_seed_weight: 4.0
+
+  # Weighted Personalized PageRank over the custom semantic ASG.
+  ppr:
+    damping: 0.85
+    epsilon: 0.00000001
+    max_iterations: 100
+    edge_weights:
+      calls: 1.0
+      references: 0.7
+      contains: 0.15
+      imports: 0.5
+      implements: 0.9
+      field_of: 0.25
+      variant_of: 0.25
+
+  # Custom RRF stream order: semantic, BM25, structural PPR.
+  rrf:
+    k: 60.0
+    weights: [1.15, 1.0, 1.1]
+    score_alpha: 0.15
+
+context:
+  surrounding_lines: 16
+  max_dependencies: 5
+  max_context_tokens: 4000
+  dependency_token_budget: 2400
