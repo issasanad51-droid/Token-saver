@@ -1,19 +1,23 @@
 //! Minimal MCP (Model Context Protocol) server for Token-saver.
 //!
-//! Exposes three tools over JSON-RPC via stdio:
+//! Exposes tools over JSON-RPC via stdio:
 //! - `search_code`: Search the codebase using the hybrid pipeline
 //! - `save_memory`: Store a fact or design decision
 //! - `recall`: Recall stored memories matching a query
+//! - `forget_memory`: Delete a memory by id
+//! - `health`: Return server health/info
+//! - `list_files`: List all indexed files with node counts
+//! - `get_context`: Get context around a cursor position
 
 use std::io::{BufRead, Write};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::asg::SharedAsg;
 use crate::memory::MemoryStore;
 use crate::search::SearchEngine;
-use crate::asg::SharedAsg;
-use std::sync::Arc;
 
 // MCP JSON-RPC types
 #[derive(Debug, Deserialize)]
@@ -50,7 +54,7 @@ struct ToolInfo {
 pub async fn run_mcp_server(
     search_engine: Arc<SearchEngine>,
     asg: SharedAsg,
-    memory_store: MemoryStore,
+    memory_store: Arc<tokio::sync::Mutex<MemoryStore>>,
 ) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -100,7 +104,7 @@ async fn handle_request(
     req: JsonRpcRequest,
     search_engine: &SearchEngine,
     asg: &SharedAsg,
-    memory_store: &MemoryStore,
+    memory_store: &Arc<tokio::sync::Mutex<MemoryStore>>,
 ) -> (Option<Value>, Option<JsonRpcError>) {
     match req.method.as_str() {
         "initialize" => {
@@ -137,7 +141,8 @@ async fn handle_request(
                         "type": "object",
                         "properties": {
                             "content": { "type": "string", "description": "The memory to store" },
-                            "namespace": { "type": "string", "description": "Optional scope tag" }
+                            "namespace": { "type": "string", "description": "Optional scope tag" },
+                            "importance": { "type": "number", "description": "Optional importance 0.0-1.0" }
                         },
                         "required": ["content"]
                     }),
@@ -152,6 +157,46 @@ async fn handle_request(
                             "top_k": { "type": "integer", "description": "Max results", "default": 10 }
                         },
                         "required": ["query"]
+                    }),
+                },
+                ToolInfo {
+                    name: "forget_memory".to_string(),
+                    description: "Delete a stored memory by its id".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "The memory id to delete" }
+                        },
+                        "required": ["id"]
+                    }),
+                },
+                ToolInfo {
+                    name: "health".to_string(),
+                    description: "Return server health and indexing statistics".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                },
+                ToolInfo {
+                    name: "list_files".to_string(),
+                    description: "List all indexed source files with their node counts".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                },
+                ToolInfo {
+                    name: "get_context".to_string(),
+                    description: "Get context around a cursor position in a file".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "file_path": { "type": "string", "description": "Path to the source file" },
+                            "line": { "type": "integer", "description": "Line number (0-indexed)" },
+                            "column": { "type": "integer", "description": "Column number (0-indexed)" }
+                        },
+                        "required": ["file_path", "line", "column"]
                     }),
                 },
             ];
@@ -209,7 +254,10 @@ async fn handle_request(
                         .get("namespace")
                         .and_then(|v| v.as_str())
                         .map(String::from);
-                    let id = memory_store.save(content, namespace);
+                    let importance = args
+                        .get("importance")
+                        .and_then(|v| v.as_f64());
+                    let id = memory_store.lock().await.save(content, namespace, importance);
                     (
                         Some(serde_json::json!({
                             "content": [{ "type": "text", "text": format!("Memory saved: {}", id) }]
@@ -226,10 +274,103 @@ async fn handle_request(
                         .get("top_k")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(10) as usize;
-                    let memories = memory_store.recall(query, top_k);
+                    let memories = memory_store.lock().await.recall(query, top_k);
                     (
                         Some(serde_json::json!({
                             "content": [{ "type": "text", "text": serde_json::to_string_pretty(&memories).unwrap_or_default() }]
+                        })),
+                        None,
+                    )
+                }
+                "forget_memory" => {
+                    let id = args
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let forgotten = memory_store.lock().await.forget(id);
+                    (
+                        Some(serde_json::json!({
+                            "content": [{ "type": "text", "text": if forgotten { "Memory forgotten" } else { "Memory not found" } }]
+                        })),
+                        None,
+                    )
+                }
+                "health" => {
+                    let mem = memory_store.lock().await;
+                    let result = serde_json::json!({
+                        "nodes": asg.inner.nodes.len(),
+                        "edges": asg.inner.edges.len(),
+                        "files": asg.inner.file_index.len(),
+                        "symbols": asg.inner.symbol_table.len(),
+                        "memories": mem.len()
+                    });
+                    drop(mem);
+                    (
+                        Some(serde_json::json!({
+                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }]
+                        })),
+                        None,
+                    )
+                }
+                "list_files" => {
+                    let files: Vec<serde_json::Value> = asg.inner
+                        .file_index
+                        .iter()
+                        .map(|(path, node_ids)| {
+                            serde_json::json!({
+                                "path": path.display().to_string(),
+                                "nodes": node_ids.len()
+                            })
+                        })
+                        .collect();
+                    (
+                        Some(serde_json::json!({
+                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&files).unwrap_or_default() }]
+                        })),
+                        None,
+                    )
+                }
+                "get_context" => {
+                    let file_path = args
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let line = args
+                        .get("line")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let column = args
+                        .get("column")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+
+                    // Find the node at the cursor position.
+                    let node_info = asg.inner
+                        .file_index
+                        .get(std::path::Path::new(file_path))
+                        .and_then(|node_ids| {
+                            node_ids.iter().find_map(|&id| {
+                                asg.get_node(id).map(|node| {
+                                    serde_json::json!({
+                                        "name": node.name,
+                                        "kind": node.kind,
+                                        "tracker_id": node.tracker_id,
+                                        "pagerank": node.pagerank,
+                                        "range": [node.range.0, node.range.1]
+                                    })
+                                })
+                            })
+                        });
+
+                    let result = serde_json::json!({
+                        "file": file_path,
+                        "cursor": [line, column],
+                        "node": node_info
+                    });
+
+                    (
+                        Some(serde_json::json!({
+                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }]
                         })),
                         None,
                     )

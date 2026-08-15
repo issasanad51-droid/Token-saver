@@ -4,6 +4,8 @@
 //! When a change is detected, it triggers incremental re-indexing via the
 //! existing Merkle diff pipeline.
 
+pub mod reindex;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -18,7 +20,7 @@ pub struct FileChangeEvent {
     pub kind: ChangeKind,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ChangeKind {
     Created,
     Modified,

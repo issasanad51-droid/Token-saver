@@ -22,6 +22,7 @@ use crate::memory::MemoryStore;
 use crate::persistence::PersistentStore;
 use crate::search::SearchEngine;
 use crate::tracker::{ContextTracker, CursorPayload};
+use crate::watcher::reindex::SharedIndexes;
 
 // ---------------------------------------------------------------------------
 // API types
@@ -143,14 +144,14 @@ pub struct ServerState {
     pub registry: Arc<ChunkRegistry>,
     pub search_engine: Arc<SearchEngine>,
     pub tracker: Arc<ContextTracker>,
-    pub ast_trigram: Arc<TrigramIndex>,
-    pub ast_merkle: Arc<MerkleTree>,
+    pub indexes: SharedIndexes,
     pub active_requests: Arc<tokio::sync::Mutex<HashMap<String, ActiveRequest>>>,
     pub request_counter: Arc<AtomicU64>,
     pub workspace: Arc<std::path::PathBuf>,
     pub debounce_ms: u64,
-    pub memory_store: MemoryStore,
+    pub memory_store: Arc<tokio::sync::Mutex<MemoryStore>>,
     pub persistent_store: Option<Arc<PersistentStore>>,
+    pub started_at: std::time::Instant,
 }
 
 impl ServerState {
@@ -198,14 +199,14 @@ impl ServerState {
             registry: Arc::new(registry),
             search_engine: Arc::new(search_engine),
             tracker,
-            ast_trigram: Arc::new(ast_trigram),
-            ast_merkle: Arc::new(ast_merkle),
+            indexes: SharedIndexes::new(ast_merkle, ast_trigram),
             active_requests: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             request_counter: Arc::new(AtomicU64::new(0)),
             workspace: Arc::new(workspace),
             debounce_ms: config.debounce_ms,
-            memory_store: MemoryStore::new(),
+            memory_store: Arc::new(tokio::sync::Mutex::new(MemoryStore::new())),
             persistent_store: None,
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -473,15 +474,18 @@ pub async fn search_handler(
 }
 
 pub async fn health_handler(State(state): State<ServerState>) -> impl IntoResponse {
+    let trigram = state.indexes.trigram.read().await;
+    let merkle = state.indexes.merkle.read().await;
+    let memory_count = state.memory_store.lock().await.len();
     Json(HealthResponse {
         status: "ok",
         workspace: state.workspace.display().to_string(),
         asg_nodes: state.asg.inner.nodes.len(),
         asg_edges: state.asg.inner.edges.len(),
         compressed_chunks: state.registry.chunks.len(),
-        ast_chunks: state.ast_trigram.len(),
-        merkle_root: state.ast_merkle.root_hash(),
-        memory_count: state.memory_store.len(),
+        ast_chunks: trigram.len(),
+        merkle_root: merkle.root_hash(),
+        memory_count,
     })
 }
 
@@ -493,7 +497,7 @@ pub async fn save_memory_handler(
     State(state): State<ServerState>,
     Json(request): Json<SaveMemoryRequest>,
 ) -> impl IntoResponse {
-    let id = state.memory_store.save(&request.content, request.namespace);
+    let id = state.memory_store.lock().await.save(&request.content, request.namespace, None);
     Json(SaveMemoryResponse { id })
 }
 
@@ -501,7 +505,7 @@ pub async fn recall_memory_handler(
     State(state): State<ServerState>,
     Json(request): Json<RecallMemoryRequest>,
 ) -> impl IntoResponse {
-    let memories = state.memory_store.recall(&request.query, request.top_k);
+    let memories = state.memory_store.lock().await.recall(&request.query, request.top_k);
     Json(RecallMemoryResponse { memories })
 }
 
@@ -509,7 +513,7 @@ pub async fn forget_memory_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let forgotten = state.memory_store.forget(&id);
+    let forgotten = state.memory_store.lock().await.forget(&id);
     Json(ForgetMemoryResponse { forgotten })
 }
 
@@ -517,8 +521,66 @@ pub async fn list_memory_handler(
     State(state): State<ServerState>,
     Query(query): Query<ListMemoryQuery>,
 ) -> impl IntoResponse {
-    let memories = state.memory_store.list(query.namespace.as_deref());
+    let memories = state.memory_store.lock().await.list(query.namespace.as_deref());
     Json(ListMemoryResponse { memories })
+}
+
+// ---------------------------------------------------------------------------
+// Stats endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatsResponse {
+    pub workspace: String,
+    pub asg_nodes: usize,
+    pub asg_edges: usize,
+    pub asg_edge_kinds: HashMap<String, usize>,
+    pub compressed_chunks: usize,
+    pub bytes_saved: usize,
+    pub trigram_index_size: usize,
+    pub merkle_root: Option<String>,
+    pub memory_count: usize,
+    pub uptime_secs: f64,
+}
+
+pub async fn stats_handler(State(state): State<ServerState>) -> impl IntoResponse {
+    let trigram = state.indexes.trigram.read().await;
+    let merkle = state.indexes.merkle.read().await;
+    let mem = state.memory_store.lock().await;
+
+    let mut edge_kinds: HashMap<String, usize> = HashMap::new();
+    for edge in &state.asg.inner.edges {
+        let label = match edge.kind {
+            crate::asg::EdgeKind::Calls => "calls",
+            crate::asg::EdgeKind::Contains => "contains",
+            crate::asg::EdgeKind::Imports => "imports",
+            crate::asg::EdgeKind::References => "references",
+            crate::asg::EdgeKind::Implements => "implements",
+            crate::asg::EdgeKind::FieldOf => "field_of",
+            crate::asg::EdgeKind::VariantOf => "variant_of",
+        };
+        *edge_kinds.entry(label.to_string()).or_default() += 1;
+    }
+
+    let bytes_saved: usize = state
+        .registry
+        .chunks
+        .iter()
+        .map(|entry| entry.value().bytes_saved())
+        .sum();
+
+    Json(StatsResponse {
+        workspace: state.workspace.display().to_string(),
+        asg_nodes: state.asg.inner.nodes.len(),
+        asg_edges: state.asg.inner.edges.len(),
+        asg_edge_kinds: edge_kinds,
+        compressed_chunks: state.registry.chunks.len(),
+        bytes_saved,
+        trigram_index_size: trigram.len(),
+        merkle_root: merkle.root_hash(),
+        memory_count: mem.len(),
+        uptime_secs: state.started_at.elapsed().as_secs_f64(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -528,6 +590,7 @@ pub async fn list_memory_handler(
 pub fn build_router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
+        .route("/v1/stats", get(stats_handler))
         .route("/v1/search", post(search_handler))
         .route("/v1/autocomplete", post(autocomplete_handler))
         .route("/v1/memories", post(save_memory_handler).get(list_memory_handler))
@@ -634,7 +697,7 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
         workspace.clone(),
         &config,
     );
-    state.memory_store = memory_store;
+    *state.memory_store.lock().await = memory_store;
     state.persistent_store = persistent_store.map(Arc::new);
 
     // Save to persistent store if available.
@@ -642,33 +705,53 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
         if let Err(e) = store.save_asg(&state.asg.inner) {
             warn!("failed to save ASG to persistent store: {e}");
         }
-        if let Err(e) = store.save_memories(&state.memory_store) {
+        let mem = state.memory_store.lock().await;
+        if let Err(e) = store.save_memories(&mem) {
             warn!("failed to save memories to persistent store: {e}");
         }
     }
 
-    // Start file watcher in the background.
+    // Start file watcher with reindex worker in the background.
     let watcher_workspace = workspace.clone();
+    let watcher_indexes = state.indexes.clone();
+    let watcher_debounce = std::time::Duration::from_millis(
+        std::env::var("TOKEN_SAVER_WATCHER_DEBOUNCE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500),
+    );
     tokio::spawn(async move {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        match crate::watcher::watch_workspace(watcher_workspace, tx).await {
-            Ok(()) => {
-                while rx.recv().await.is_some() {
-                    // File change events received; incremental re-indexing
-                    // would be triggered here via the Merkle diff pipeline.
-                    // For now, just log that changes are detected.
-                    debug!("file change detected, incremental re-indexing pending");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let watcher_task = crate::watcher::watch_workspace(watcher_workspace.clone(), tx);
+        let reindex_task = crate::watcher::reindex::run_reindex_worker(
+            watcher_workspace,
+            watcher_indexes,
+            rx,
+            watcher_debounce,
+        );
+
+        tokio::select! {
+            result = watcher_task => {
+                if let Err(e) = result {
+                    warn!("file watcher failed: {e}");
                 }
             }
-            Err(e) => {
-                warn!("file watcher failed to start: {e}");
+            _ = reindex_task => {
+                info!("reindex worker exited");
             }
         }
     });
 
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     info!("Token Saver listening on http://{}", config.bind);
-    axum::serve(listener, build_router(state)).await?;
+
+    // Graceful shutdown on Ctrl+C.
+    tokio::select! {
+        result = axum::serve(listener, build_router(state)) => result?,
+        _ = tokio::signal::ctrl_c() => {
+            info!("received Ctrl+C, shutting down gracefully");
+        }
+    }
     Ok(())
 }
 
@@ -702,7 +785,7 @@ pub async fn run_mcp_server_with_config(config: TokenSaverConfig) -> anyhow::Res
     ));
     search_engine.precompute_embeddings().await;
 
-    let memory_store = MemoryStore::new();
+    let memory_store = Arc::new(tokio::sync::Mutex::new(MemoryStore::new()));
 
     crate::mcp::run_mcp_server(search_engine, shared_asg, memory_store).await
 }

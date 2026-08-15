@@ -20,4 +20,5 @@ pub use server::*;
 pub use memory::*;
 pub use mcp::*;
 pub use watcher::*;
+pub use watcher::reindex::{SharedIndexes, ReindexReport};
 pub use persistence::*;

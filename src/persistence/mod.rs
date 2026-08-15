@@ -113,7 +113,7 @@ impl PersistentStore {
                 for mem in memories {
                     // Re-insert by saving the content, but we need to preserve the
                     // original id and metadata. Use the internal insert approach.
-                    store.save(&mem.content, mem.namespace.clone());
+                    store.save(&mem.content, mem.namespace.clone(), None);
                 }
             }
             None => {}
