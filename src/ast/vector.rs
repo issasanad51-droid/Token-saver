@@ -49,12 +49,23 @@ impl Obfuscator {
         if let Some(alias) = self.file_alias.get(path) {
             return alias.clone();
         }
-        let mut hasher = Sha256::new();
-        hasher.update(self.alias_salt);
-        hasher.update(path.to_string_lossy().as_bytes());
-        let alias = format!("f_{:x}", hasher.finalize());
+        let alias = self.keyed_alias("f", path.to_string_lossy().as_bytes());
         self.file_alias.insert(path.to_path_buf(), alias.clone());
         alias
+    }
+
+    /// Hide the local chunk tracker as well as the file path. AST chunk IDs
+    /// contain relative paths, so uploading them verbatim would undo the file
+    /// alias protection.
+    pub fn chunk_alias_for(&self, chunk_id: &str) -> String {
+        self.keyed_alias("c", chunk_id.as_bytes())
+    }
+
+    fn keyed_alias(&self, prefix: &str, value: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.alias_salt);
+        hasher.update(value);
+        format!("{prefix}_{:x}", hasher.finalize())
     }
 
     /// Encrypt a chunk's source. Returns `(nonce_hex, ciphertext_hex)`.
@@ -147,6 +158,8 @@ pub struct VectorSync<S: VectorStore> {
     store: S,
     /// Local cache of last-synced content hashes (for incremental upsert).
     pub synced: HashMap<String, String>,
+    /// Local chunk tracker -> keyed remote alias.
+    remote_ids: HashMap<String, String>,
 }
 
 impl<S: VectorStore> VectorSync<S> {
@@ -156,6 +169,7 @@ impl<S: VectorStore> VectorSync<S> {
             obfuscator: Obfuscator::new(key)?,
             store,
             synced: HashMap::new(),
+            remote_ids: HashMap::new(),
         })
     }
 
@@ -190,9 +204,10 @@ impl<S: VectorStore> VectorSync<S> {
                 continue;
             }
             let alias = self.obfuscator.alias_for(&chunk.file_path);
+            let remote_id = self.obfuscator.chunk_alias_for(&chunk.id);
             let (nonce, ct) = self.obfuscator.encrypt(&chunk.source)?;
             let ob = ObfuscatedChunk {
-                chunk_id: chunk.id.clone(),
+                chunk_id: remote_id.clone(),
                 file_alias: alias,
                 encrypted_body: ct,
                 nonce,
@@ -202,6 +217,7 @@ impl<S: VectorStore> VectorSync<S> {
             upserted.push(ob);
             self.synced
                 .insert(chunk.id.clone(), chunk.content_hash.clone());
+            self.remote_ids.insert(chunk.id.clone(), remote_id);
         }
         self.store.upsert(&upserted)?;
         Ok(SyncReport {
@@ -212,10 +228,16 @@ impl<S: VectorStore> VectorSync<S> {
 
     /// Delete chunks that were removed from the codebase.
     pub fn delete(&mut self, chunk_ids: &[String]) -> anyhow::Result<()> {
+        let mut remote_ids = Vec::with_capacity(chunk_ids.len());
         for id in chunk_ids {
             self.synced.remove(id);
+            let remote_id = self
+                .remote_ids
+                .remove(id)
+                .unwrap_or_else(|| self.obfuscator.chunk_alias_for(id));
+            remote_ids.push(remote_id);
         }
-        self.store.delete(chunk_ids)
+        self.store.delete(&remote_ids)
     }
 
     /// Decrypt a stored chunk's body locally (hydration helper).
@@ -299,6 +321,9 @@ mod tests {
         let c = chunk("fn_a", "pub fn a() {}");
         let r1 = sync.sync(&[c.clone()]).unwrap();
         assert_eq!(r1.upserted, 1);
+        let remote_id = sync.store.data.keys().next().unwrap();
+        assert!(remote_id.starts_with("c_"));
+        assert!(!remote_id.contains("fn_a"));
 
         // Re-sync identical content → skipped.
         let r2 = sync.sync(&[c.clone()]).unwrap();
