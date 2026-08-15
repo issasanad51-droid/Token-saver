@@ -12,6 +12,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::AllowOrigin;
 use tracing::{debug, info, warn};
 
 use crate::asg::{Asg, SharedAsg};
@@ -129,6 +131,58 @@ pub struct ForgetMemoryResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Simple in-memory rate limiter (token bucket per IP)
+// ---------------------------------------------------------------------------
+
+/// A lightweight token-bucket rate limiter keyed by IP address.
+/// Each IP gets `max_tokens` tokens that refill at `refill_per_sec` rate.
+#[derive(Clone)]
+pub struct RateLimiter {
+    buckets: Arc<tokio::sync::Mutex<HashMap<String, RateBucket>>>,
+    max_tokens: u32,
+    refill_per_sec: u32,
+}
+
+struct RateBucket {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl RateLimiter {
+    pub fn new(max_tokens: u32, refill_per_sec: u32) -> Self {
+        Self {
+            buckets: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            max_tokens: max_tokens.max(1),
+            refill_per_sec: refill_per_sec.max(1),
+        }
+    }
+
+    /// Check if a request from the given key is allowed.
+    /// Returns true if the request is allowed, false if rate-limited.
+    pub async fn allow(&self, key: &str) -> bool {
+        let mut buckets = self.buckets.lock().await;
+        let now = std::time::Instant::now();
+        let bucket = buckets.entry(key.to_string()).or_insert_with(|| RateBucket {
+            tokens: self.max_tokens as f64,
+            last_refill: now,
+        });
+
+        // Refill tokens based on elapsed time.
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec as f64)
+            .min(self.max_tokens as f64);
+        bucket.last_refill = now;
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
@@ -152,6 +206,11 @@ pub struct ServerState {
     pub memory_store: Arc<tokio::sync::Mutex<MemoryStore>>,
     pub persistent_store: Option<Arc<PersistentStore>>,
     pub started_at: std::time::Instant,
+    pub rate_limiter: RateLimiter,
+    /// Total HTTP requests served (all endpoints).
+    pub total_requests: Arc<AtomicU64>,
+    /// Total tokens estimated across all context/retrieval responses.
+    pub total_tokens_served: Arc<AtomicU64>,
 }
 
 impl ServerState {
@@ -207,6 +266,9 @@ impl ServerState {
             memory_store: Arc::new(tokio::sync::Mutex::new(MemoryStore::new())),
             persistent_store: None,
             started_at: std::time::Instant::now(),
+            rate_limiter: RateLimiter::new(60, 10), // 60 burst, 10/sec refill
+            total_requests: Arc::new(AtomicU64::new(0)),
+            total_tokens_served: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -445,11 +507,28 @@ pub async fn search_handler(
     State(state): State<ServerState>,
     Json(request): Json<SearchRequest>,
 ) -> impl IntoResponse {
+    state.total_requests.fetch_add(1, Ordering::Relaxed);
+
+    // Rate limit check (using a placeholder key since we don't have
+    // the client IP in this handler without additional extraction).
+    if !state.rate_limiter.allow("global").await {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
+
     let top_k = request.top_k.clamp(1, 100);
     let results = state
         .search_engine
         .search_with_context(&request.query, top_k, request.context_node_id)
         .await;
+
+    // Estimate tokens served.
+    let tokens_served: usize = results
+        .iter()
+        .filter_map(|r| state.asg.get_node(r.node_id))
+        .map(|n| crate::tracker::estimate_tokens(&n.source))
+        .sum();
+    state.total_tokens_served.fetch_add(tokens_served as u64, Ordering::Relaxed);
+
     let hits = results
         .into_iter()
         .filter_map(|result| {
@@ -470,7 +549,7 @@ pub async fn search_handler(
     Json(SearchResponse {
         query: request.query,
         hits,
-    })
+    }).into_response()
 }
 
 pub async fn health_handler(State(state): State<ServerState>) -> impl IntoResponse {
@@ -584,19 +663,335 @@ pub async fn stats_handler(State(state): State<ServerState>) -> impl IntoRespons
 }
 
 // ---------------------------------------------------------------------------
+// Context endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextRequest {
+    pub file_path: String,
+    pub line: usize,
+    pub column: usize,
+    /// Optional query for context-aware dependency retrieval.
+    #[serde(default)]
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextResponse {
+    pub node_id: Option<usize>,
+    pub node_name: Option<String>,
+    pub pagerank: Option<f64>,
+    pub surrounding_lines: String,
+    pub compressed_deps: Vec<String>,
+    pub total_tokens: usize,
+}
+
+pub async fn context_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<ContextRequest>,
+) -> impl IntoResponse {
+    let cursor = CursorPayload::new(&request.file_path, request.line, request.column);
+    let node_id = state.tracker.find_node_at_cursor(&cursor);
+    let (node_name, pagerank) = node_id
+        .and_then(|id| state.asg.get_node(id))
+        .map(|node| (Some(node.name.clone()), Some(node.pagerank)))
+        .unwrap_or((None, None));
+
+    let surrounding = state.tracker.get_surrounding_lines(&cursor);
+    let query = request.query.unwrap_or_default();
+    let compressed_deps = state
+        .tracker
+        .get_compressed_dependencies(&cursor, &query)
+        .await;
+
+    let total_tokens = crate::tracker::estimate_tokens(&surrounding)
+        + compressed_deps
+            .iter()
+            .map(|d| crate::tracker::estimate_tokens(d))
+            .sum::<usize>();
+
+    Json(ContextResponse {
+        node_id,
+        node_name,
+        pagerank,
+        surrounding_lines: surrounding,
+        compressed_deps,
+        total_tokens,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Graph exploration endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphNodeResponse {
+    pub node_id: usize,
+    pub tracker_id: String,
+    pub name: String,
+    pub kind: String,
+    pub file_path: String,
+    pub pagerank: f64,
+    pub range: (usize, usize),
+    pub incoming_edges: Vec<GraphEdge>,
+    pub outgoing_edges: Vec<GraphEdge>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphEdge {
+    pub node_id: usize,
+    pub node_name: String,
+    pub kind: String,
+}
+
+pub async fn graph_node_handler(
+    State(state): State<ServerState>,
+    Path(node_id): Path<usize>,
+) -> Response {
+    let Some(node) = state.asg.get_node(node_id) else {
+        return (StatusCode::NOT_FOUND, "node not found").into_response();
+    };
+
+    let incoming: Vec<GraphEdge> = state
+        .asg
+        .inner
+        .reverse_adjacency
+        .get(&node_id)
+        .map(|edge_ids| {
+            edge_ids
+                .iter()
+                .filter_map(|&eid| {
+                    let edge = &state.asg.inner.edges[eid];
+                    state
+                        .asg
+                        .get_node(edge.from)
+                        .map(|n| GraphEdge {
+                            node_id: n.id,
+                            node_name: n.name.clone(),
+                            kind: format!("{:?}", edge.kind),
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let outgoing: Vec<GraphEdge> = state
+        .asg
+        .inner
+        .adjacency
+        .get(&node_id)
+        .map(|edge_ids| {
+            edge_ids
+                .iter()
+                .filter_map(|&eid| {
+                    let edge = &state.asg.inner.edges[eid];
+                    state
+                        .asg
+                        .get_node(edge.to)
+                        .map(|n| GraphEdge {
+                            node_id: n.id,
+                            node_name: n.name.clone(),
+                            kind: format!("{:?}", edge.kind),
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Json(GraphNodeResponse {
+        node_id: node.id,
+        tracker_id: node.tracker_id.clone(),
+        name: node.name.clone(),
+        kind: node.kind.clone(),
+        file_path: node.file_path.display().to_string(),
+        pagerank: node.pagerank,
+        range: node.range,
+        incoming_edges: incoming,
+        outgoing_edges: outgoing,
+    })
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Manual reindex endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReindexResponse {
+    pub status: &'static str,
+    pub message: String,
+}
+
+pub async fn reindex_handler(
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    let workspace = state.workspace.clone();
+    let indexes = state.indexes.clone();
+
+    // Run a full re-chunk + index update in the background.
+    tokio::spawn(async move {
+        let mut chunker = match AstChunker::new() {
+            Ok(c) => c.with_crate_root(workspace.as_path()),
+            Err(e) => {
+                warn!("reindex: failed to create chunker: {e}");
+                return;
+            }
+        };
+
+        let chunks = match chunker.chunk_dir(workspace.as_path()) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("reindex: failed to chunk workspace: {e}");
+                return;
+            }
+        };
+
+        // Rebuild trigram index.
+        let mut trigram = indexes.trigram.write().await;
+        *trigram = TrigramIndex::new(3);
+        trigram.index(&chunks);
+        drop(trigram);
+
+        // Rebuild merkle tree.
+        let new_merkle = MerkleTree::build(&chunks);
+        *indexes.merkle.write().await = new_merkle;
+
+        info!("manual reindex complete: {} chunks", chunks.len());
+    });
+
+    Json(ReindexResponse {
+        status: "ok",
+        message: "reindex started in background".to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Update memory endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateMemoryRequest {
+    pub importance: Option<f64>,
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateMemoryResponse {
+    pub updated: bool,
+}
+
+pub async fn update_memory_handler(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateMemoryRequest>,
+) -> impl IntoResponse {
+    let updated = state.memory_store.lock().await.update(
+        &id,
+        request.importance,
+        Some(request.namespace),
+    );
+    Json(UpdateMemoryResponse { updated })
+}
+
+// ---------------------------------------------------------------------------
+// Token-savings metrics endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsResponse {
+    pub total_requests: u64,
+    pub total_tokens_served: u64,
+    pub compressed_chunks: usize,
+    pub bytes_saved: usize,
+    pub original_bytes: usize,
+    pub compression_ratio: f64,
+    pub uptime_secs: f64,
+    pub requests_per_second: f64,
+    pub memory_count: usize,
+    pub asg_nodes: usize,
+    pub asg_edges: usize,
+}
+
+pub async fn metrics_handler(State(state): State<ServerState>) -> impl IntoResponse {
+    let total_requests = state.total_requests.load(Ordering::Relaxed);
+    let total_tokens = state.total_tokens_served.load(Ordering::Relaxed);
+    let uptime = state.started_at.elapsed().as_secs_f64();
+
+    let mut bytes_saved = 0usize;
+    let mut original_bytes = 0usize;
+    for entry in state.registry.chunks.iter() {
+        let chunk = entry.value();
+        bytes_saved += chunk.bytes_saved();
+        original_bytes += chunk.original_bytes;
+    }
+
+    let compression_ratio = if original_bytes > 0 {
+        bytes_saved as f64 / original_bytes as f64
+    } else {
+        0.0
+    };
+
+    let rps = if uptime > 0.0 {
+        total_requests as f64 / uptime
+    } else {
+        0.0
+    };
+
+    let mem = state.memory_store.lock().await;
+    Json(MetricsResponse {
+        total_requests,
+        total_tokens_served: total_tokens,
+        compressed_chunks: state.registry.chunks.len(),
+        bytes_saved,
+        original_bytes,
+        compression_ratio,
+        uptime_secs: uptime,
+        requests_per_second: rps,
+        memory_count: mem.len(),
+        asg_nodes: state.asg.inner.nodes.len(),
+        asg_edges: state.asg.inner.edges.len(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
 
-pub fn build_router(state: ServerState) -> Router {
-    Router::new()
+pub fn build_router(state: ServerState, cors_origin: Option<&str>) -> Router {
+    let router = Router::new()
         .route("/health", get(health_handler))
         .route("/v1/stats", get(stats_handler))
         .route("/v1/search", post(search_handler))
         .route("/v1/autocomplete", post(autocomplete_handler))
+        .route("/v1/context", post(context_handler))
+        .route("/v1/graph/{node_id}", get(graph_node_handler))
+        .route("/v1/reindex", post(reindex_handler))
+        .route("/v1/metrics", get(metrics_handler))
         .route("/v1/memories", post(save_memory_handler).get(list_memory_handler))
         .route("/v1/memories/recall", post(recall_memory_handler))
         .route("/v1/memories/{id}", delete(forget_memory_handler))
-        .with_state(state)
+        .route("/v1/memories/{id}/update", post(update_memory_handler))
+        .with_state(state);
+
+    // Apply CORS layer if an origin is configured.
+    if let Some(origin) = cors_origin {
+        let allow_origin = if origin == "*" {
+            AllowOrigin::any()
+        } else {
+            AllowOrigin::exact(
+                origin.parse().unwrap_or_else(|_| {
+                    axum::http::HeaderValue::from_bytes(b"*").unwrap()
+                })
+            )
+        };
+        let cors = CorsLayer::new()
+            .allow_origin(allow_origin)
+            .allow_methods(Any)
+            .allow_headers(Any);
+        router.layer(cors)
+    } else {
+        router
+    }
 }
 
 pub async fn run_server() -> anyhow::Result<()> {
@@ -718,7 +1113,7 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
         std::env::var("TOKEN_SAVER_WATCHER_DEBOUNCE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(500),
+            .unwrap_or(config.watcher_debounce_ms),
     );
     tokio::spawn(async move {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -742,14 +1137,45 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
         }
     });
 
+    // Periodic memory pruning — every 10 minutes, remove memories whose
+    // effective decay score has fallen below 0.01.
+    {
+        let prune_store = state.memory_store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(600));
+            loop {
+                interval.tick().await;
+                let pruned = prune_store.lock().await.prune_decayed(0.01);
+                if pruned > 0 {
+                    info!("periodic prune: removed {pruned} decayed memories");
+                }
+            }
+        });
+    }
+
+    let cors_origin = config.cors_origin.as_deref();
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     info!("Token Saver listening on http://{}", config.bind);
 
-    // Graceful shutdown on Ctrl+C.
+    // Graceful shutdown on Ctrl+C — save persistent state before exiting.
+    let shutdown_state = state.clone();
     tokio::select! {
-        result = axum::serve(listener, build_router(state)) => result?,
+        result = axum::serve(listener, build_router(state, cors_origin)) => result?,
         _ = tokio::signal::ctrl_c() => {
             info!("received Ctrl+C, shutting down gracefully");
+            // Persist ASG and memories to redb on shutdown.
+            if let Some(ref store) = shutdown_state.persistent_store {
+                info!("saving ASG and memories to persistent store before exit");
+                if let Err(e) = store.save_asg(&shutdown_state.asg.inner) {
+                    warn!("failed to save ASG on shutdown: {e}");
+                }
+                let mem = shutdown_state.memory_store.lock().await;
+                if let Err(e) = store.save_memories(&mem) {
+                    warn!("failed to save memories on shutdown: {e}");
+                } else {
+                    info!("saved {} memories on shutdown", mem.len());
+                }
+            }
         }
     }
     Ok(())

@@ -161,18 +161,13 @@ async fn apply_incremental_update(
     {
         let mut trigram = indexes.trigram.write().await;
 
-        // Remove chunks belonging to changed or deleted files.
-        // We need to scan the existing index to find matching chunks.
-        let ids_to_remove: Vec<String> = {
-            // TrigramIndex doesn't expose a file-based removal, so we
-            // rely on the Merkle diff to tell us what changed.
-            // For now, we'll add new chunks (which replaces by id).
-            Vec::new()
-        };
-
-        for id in &ids_to_remove {
-            trigram.remove(id);
-            report.chunks_removed += 1;
+        // Remove chunks belonging to changed or deleted files using file-path
+        // based removal, which correctly cleans up the inverted index.
+        for (path, kind) in changes {
+            if *kind == ChangeKind::Deleted || *kind == ChangeKind::Modified {
+                let removed = trigram.remove_by_file(path);
+                report.chunks_removed += removed;
+            }
         }
 
         // Add/update new chunks.

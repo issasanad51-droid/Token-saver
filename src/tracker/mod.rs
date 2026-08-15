@@ -251,7 +251,7 @@ impl ContextTracker {
 /// byte than prose. We use a conservative 3.2 bytes/token ratio for code
 /// (vs. ~4 for natural language) and count special characters that tend to
 /// each consume a full token (brackets, colons, arrows, semicolons).
-fn estimate_tokens(text: &str) -> usize {
+pub fn estimate_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }

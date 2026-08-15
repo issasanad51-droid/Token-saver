@@ -160,6 +160,22 @@ impl MemoryStore {
         self.memories.remove(id).is_some()
     }
 
+    /// Update an existing memory's importance and/or namespace.
+    /// Returns true if the memory was found and updated.
+    pub fn update(&self, id: &str, importance: Option<f64>, namespace: Option<Option<String>>) -> bool {
+        if let Some(mut mem) = self.memories.get_mut(id) {
+            if let Some(imp) = importance {
+                mem.importance = imp.clamp(0.0, 1.0);
+            }
+            if let Some(ns) = namespace {
+                mem.namespace = ns;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// List all memories, optionally filtered by namespace.
     pub fn list(&self, namespace: Option<&str>) -> Vec<Memory> {
         self.memories
@@ -183,6 +199,17 @@ impl MemoryStore {
         } else {
             None
         }
+    }
+
+    /// Insert a fully-constructed memory directly, preserving its original
+    /// id, importance, access_count, created_at, and last_accessed fields.
+    /// Used by the persistence layer to restore memories from redb without
+    /// regenerating ids or losing metadata.
+    pub fn insert_memory(&self, memory: Memory) {
+        // Ensure the sequence counter is ahead of any timestamp-based id.
+        // Memory ids are `mem_{timestamp}_{seq}`, so we just bump the seq.
+        let _ = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        self.memories.insert(memory.id.clone(), memory);
     }
 
     /// Number of stored memories.
@@ -274,9 +301,42 @@ mod tests {
         assert_eq!(store.len(), 1);
 
         // Prune with a threshold above the effective score
-        let pruned = store.prune_decayed(0.5) as u64;
-        // The low-importance memory should be pruned (its decay factor
-        // will be very small since it was just created but importance is 0.01)
-        assert!(pruned >= 0); // May or may not be pruned depending on recency boost
+        let _pruned = store.prune_decayed(0.5);
+        // The low-importance memory may be pruned depending on recency boost
+    }
+
+    #[test]
+    fn insert_memory_preserves_metadata() {
+        let store = MemoryStore::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let memory = Memory {
+            id: "mem_custom_42".to_string(),
+            content: "preserved content".to_string(),
+            namespace: Some("test".to_string()),
+            created_at: now - 3600,
+            last_accessed: now - 1800,
+            access_count: 7,
+            importance: 0.95,
+        };
+        store.insert_memory(memory);
+        let loaded = store.get("mem_custom_42").unwrap();
+        assert_eq!(loaded.content, "preserved content");
+        assert_eq!(loaded.namespace, Some("test".to_string()));
+        assert_eq!(loaded.importance, 0.95);
+        assert_eq!(loaded.access_count, 8); // get() increments it
+    }
+
+    #[test]
+    fn update_changes_importance_and_namespace() {
+        let store = MemoryStore::new();
+        let id = store.save("test", Some("old_ns".to_string()), Some(0.5));
+        let updated = store.update(&id, Some(0.9), Some(Some("new_ns".to_string())));
+        assert!(updated);
+        let mem = store.get(&id).unwrap();
+        assert_eq!(mem.importance, 0.9);
+        assert_eq!(mem.namespace, Some("new_ns".to_string()));
     }
 }

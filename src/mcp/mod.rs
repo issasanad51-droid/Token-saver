@@ -8,6 +8,7 @@
 //! - `health`: Return server health/info
 //! - `list_files`: List all indexed files with node counts
 //! - `get_context`: Get context around a cursor position
+//! - `update_memory`: Update an existing memory's importance or namespace
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
@@ -199,6 +200,19 @@ async fn handle_request(
                         "required": ["file_path", "line", "column"]
                     }),
                 },
+                ToolInfo {
+                    name: "update_memory".to_string(),
+                    description: "Update an existing memory's importance or namespace".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "The memory id to update" },
+                            "importance": { "type": "number", "description": "New importance 0.0-1.0" },
+                            "namespace": { "type": "string", "description": "New namespace" }
+                        },
+                        "required": ["id"]
+                    }),
+                },
             ];
             (Some(serde_json::json!({ "tools": tools })), None)
         }
@@ -371,6 +385,30 @@ async fn handle_request(
                     (
                         Some(serde_json::json!({
                             "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }]
+                        })),
+                        None,
+                    )
+                }
+                "update_memory" => {
+                    let id = args
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let importance = args
+                        .get("importance")
+                        .and_then(|v| v.as_f64());
+                    let namespace = args
+                        .get("namespace")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let updated = memory_store.lock().await.update(
+                        id,
+                        importance,
+                        Some(namespace),
+                    );
+                    (
+                        Some(serde_json::json!({
+                            "content": [{ "type": "text", "text": if updated { "Memory updated" } else { "Memory not found" } }]
                         })),
                         None,
                     )

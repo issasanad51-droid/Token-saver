@@ -82,6 +82,31 @@ impl TrigramIndex {
         }
     }
 
+    /// Remove all chunks belonging to a given file path.
+    /// Returns the number of chunks removed.
+    pub fn remove_by_file(&mut self, file_path: &std::path::Path) -> usize {
+        let ids_to_remove: Vec<String> = self
+            .docs
+            .iter()
+            .filter(|(_, doc)| doc.chunk.file_path == file_path)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let count = ids_to_remove.len();
+        for id in &ids_to_remove {
+            self.remove(id);
+        }
+        count
+    }
+
+    /// List all unique file paths currently indexed.
+    pub fn indexed_files(&self) -> Vec<std::path::PathBuf> {
+        let mut files: HashSet<std::path::PathBuf> = HashSet::new();
+        for doc in self.docs.values() {
+            files.insert(doc.chunk.file_path.clone());
+        }
+        files.into_iter().collect()
+    }
+
     /// Score chunks by trigram overlap with the query.
     ///
     /// Returns up to `top_k` hits sorted by Jaccard similarity, tie-broken by
@@ -209,5 +234,38 @@ mod tests {
         idx.remove("a");
         assert!(idx.is_empty());
         assert!(idx.search("hello", 5).is_empty());
+    }
+
+    #[test]
+    fn remove_by_file_clears_all_chunks_for_path() {
+        let mut idx = TrigramIndex::new(3);
+
+        // Create chunks from two different files.
+        let file_a = std::path::PathBuf::from("a.rs");
+        let file_b = std::path::PathBuf::from("b.rs");
+        let mut chunk_a = chunk("a", "function alpha");
+        chunk_a.file_path = file_a.clone();
+        let mut chunk_b1 = chunk("b1", "struct Beta");
+        chunk_b1.file_path = file_b.clone();
+        let mut chunk_b2 = chunk("b2", "enum Gamma");
+        chunk_b2.file_path = file_b.clone();
+
+        idx.add(chunk_a);
+        idx.add(chunk_b1);
+        idx.add(chunk_b2);
+        assert_eq!(idx.len(), 3);
+
+        // Remove all chunks from file b.rs
+        let removed = idx.remove_by_file(&file_b);
+        assert_eq!(removed, 2);
+        assert_eq!(idx.len(), 1);
+
+        // File a.rs chunk is still searchable
+        let hits = idx.search("alpha", 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk_id, "a");
+
+        // File b.rs chunks are gone
+        assert!(idx.search("Beta", 5).is_empty());
     }
 }

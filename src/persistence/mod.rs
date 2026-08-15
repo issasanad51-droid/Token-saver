@@ -103,7 +103,7 @@ impl PersistentStore {
         self.save(MEMORIES_KEY, &data)
     }
 
-    /// Load memories into a MemoryStore.
+    /// Load memories into a MemoryStore, preserving original ids and metadata.
     pub fn load_memories(&self) -> anyhow::Result<crate::memory::MemoryStore> {
         let store = crate::memory::MemoryStore::new();
         match self.load(MEMORIES_KEY)? {
@@ -111,9 +111,9 @@ impl PersistentStore {
                 let memories: Vec<crate::memory::Memory> = serde_json::from_slice(&data)
                     .with_context(|| "failed to deserialize memories")?;
                 for mem in memories {
-                    // Re-insert by saving the content, but we need to preserve the
-                    // original id and metadata. Use the internal insert approach.
-                    store.save(&mem.content, mem.namespace.clone(), None);
+                    // insert_memory preserves the original id, importance,
+                    // access_count, created_at, and last_accessed fields.
+                    store.insert_memory(mem);
                 }
             }
             None => {}
