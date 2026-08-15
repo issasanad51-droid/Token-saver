@@ -23,6 +23,32 @@ pub struct CompressedChunk {
     pub compressed_source: String,
     pub dictionary: HashMap<String, String>, // original identifier -> token
     pub reverse_dictionary: HashMap<String, String>, // token -> original identifier
+    pub original_bytes: usize,
+    /// Bytes sent to the model, including the compact alias legend.
+    pub compressed_bytes: usize,
+}
+
+impl CompressedChunk {
+    /// Render an independently understandable prompt chunk. Previously only the
+    /// substituted body was emitted, which saved bytes but gave the model no
+    /// way to interpret `$a`/`$b` aliases.
+    pub fn prompt_text(&self) -> String {
+        if self.dictionary.is_empty() {
+            return self.compressed_source.clone();
+        }
+        let mut aliases: Vec<(&String, &String)> = self.dictionary.iter().collect();
+        aliases.sort_by(|(_, left_token), (_, right_token)| left_token.cmp(right_token));
+        let legend = aliases
+            .into_iter()
+            .map(|(original, token)| format!("{token}={original}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("// aliases:{legend}\n{}", self.compressed_source)
+    }
+
+    pub fn bytes_saved(&self) -> usize {
+        self.original_bytes.saturating_sub(self.compressed_bytes)
+    }
 }
 
 /// Thread-safe registry mapping compressed node IDs back to original text.
@@ -56,8 +82,11 @@ impl ChunkRegistry {
         let chunk = self.chunks.get(&node_id)?;
         let mut result = chunk.compressed_source.clone();
 
-        // Replace tokens with original identifiers.
-        for (token, original) in &chunk.reverse_dictionary {
+        // Replace longest tokens first (`$aa` before `$a`) so one compact alias
+        // can never corrupt another during hydration.
+        let mut aliases: Vec<(&String, &String)> = chunk.reverse_dictionary.iter().collect();
+        aliases.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+        for (token, original) in aliases {
             result = result.replace(token, original);
         }
 
@@ -113,7 +142,7 @@ impl IdentifierExtractor {
             if ch.is_alphanumeric() || ch == '_' {
                 current.push(ch);
             } else {
-                if current.len() > 3 && !self.keywords.contains(current.as_str()) {
+                if self.is_custom_identifier(&current) {
                     identifiers.push(current.clone());
                 }
                 current.clear();
@@ -121,7 +150,7 @@ impl IdentifierExtractor {
         }
 
         // Handle trailing identifier.
-        if current.len() > 3 && !self.keywords.contains(current.as_str()) {
+        if self.is_custom_identifier(&current) {
             identifiers.push(current);
         }
 
@@ -129,6 +158,16 @@ impl IdentifierExtractor {
         let mut seen = std::collections::HashSet::new();
         identifiers.retain(|id| seen.insert(id.clone()));
         identifiers
+    }
+
+    fn is_custom_identifier(&self, value: &str) -> bool {
+        value.len() > 3
+            && value
+                .chars()
+                .next()
+                .map(|first| first == '_' || first.is_alphabetic())
+                .unwrap_or(false)
+            && !self.keywords.contains(value)
     }
 }
 
@@ -170,21 +209,19 @@ impl TokenGenerator {
         }
     }
 
-    fn generate_token(&self, index: usize) -> String {
-        const CHARS: &[char] = &[
-            'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q',
-            'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
-            'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y',
-            'Z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-        ];
-
-        if index < CHARS.len() {
-            format!("${}", CHARS[index])
-        } else {
-            let first = CHARS[index / CHARS.len()];
-            let second = CHARS[index % CHARS.len()];
-            format!("${}{}", first, second)
+    fn generate_token(&self, mut index: usize) -> String {
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let base = CHARS.len();
+        let mut suffix = Vec::new();
+        loop {
+            suffix.push(CHARS[index % base] as char);
+            if index < base {
+                break;
+            }
+            index = index / base - 1;
         }
+        suffix.reverse();
+        format!("${}", suffix.into_iter().collect::<String>())
     }
 }
 
@@ -227,59 +264,120 @@ impl ChunkCompressor {
         registry
     }
 
-    /// Compress a single node's source code.
+    /// Compress a single node's source code. Aliases are retained only when
+    /// the body plus its legend is strictly smaller than the original source.
     pub fn compress_node(&mut self, node: &Node) -> CompressedChunk {
-        let identifiers = self.extractor.extract(&node.source);
-        let mut dictionary: HashMap<String, String> = HashMap::new();
-        let mut reverse_dictionary: HashMap<String, String> = HashMap::new();
-        let mut compressed_source = node.source.clone();
-
-        for id in identifiers {
-            let token = self.token_gen.next_token();
-            dictionary.insert(id.clone(), token.clone());
-            reverse_dictionary.insert(token.clone(), id.clone());
-
-            // Replace all occurrences of the identifier with the token.
-            // Use word-boundary matching to avoid partial replacements.
-            let pattern = format!(r"\b{}\b", regex::escape(&id));
-            compressed_source = regex::Regex::new(&pattern)
-                .unwrap()
-                .replace_all(&compressed_source, &token)
-                .to_string();
-        }
-
-        CompressedChunk {
-            node_id: node.id,
-            compressed_source,
-            dictionary,
-            reverse_dictionary,
-        }
+        self.compress(node.id, &node.source)
     }
 
     /// Compress a single source string (for ad-hoc use).
     pub fn compress_source(&mut self, source: &str) -> CompressedChunk {
+        self.compress(0, source)
+    }
+
+    fn compress(&mut self, node_id: usize, source: &str) -> CompressedChunk {
         let identifiers = self.extractor.extract(source);
         let mut dictionary: HashMap<String, String> = HashMap::new();
         let mut reverse_dictionary: HashMap<String, String> = HashMap::new();
         let mut compressed_source = source.to_string();
 
-        for id in identifiers {
-            let token = self.token_gen.next_token();
-            dictionary.insert(id.clone(), token.clone());
-            reverse_dictionary.insert(token.clone(), id.clone());
+        for identifier in identifiers {
+            let pattern = format!(r"\b{}\b", regex::escape(&identifier));
+            let Ok(expression) = regex::Regex::new(&pattern) else { continue };
+            let occurrences = expression.find_iter(source).count();
+            if occurrences == 0 {
+                continue;
+            }
 
-            let pattern = format!(r"\b{}\b", regex::escape(&id));
-            compressed_source = regex::Regex::new(&pattern)
-                .unwrap()
-                .replace_all(&compressed_source, &token)
+            let token = self.token_gen.next_token();
+            let body_savings = occurrences.saturating_mul(identifier.len().saturating_sub(token.len()));
+            // Approximate this alias's `token=identifier,` legend cost. The
+            // final exact-size check below catches interactions and header cost.
+            let legend_cost = token.len() + identifier.len() + 2;
+            if body_savings <= legend_cost {
+                continue;
+            }
+
+            compressed_source = expression
+                .replace_all(&compressed_source, regex::NoExpand(token.as_str()))
                 .to_string();
+            dictionary.insert(identifier.clone(), token.clone());
+            reverse_dictionary.insert(token, identifier);
         }
 
-        CompressedChunk {
-            node_id: 0,
+        let mut chunk = CompressedChunk {
+            node_id,
             compressed_source,
             dictionary,
             reverse_dictionary,
+            original_bytes: source.len(),
+            compressed_bytes: 0,
+        };
+        chunk.compressed_bytes = chunk.prompt_text().len();
+
+        // Never call an expansion "compression". Returning the raw source also
+        // avoids burdening the model with aliases that provide no net saving.
+        if chunk.compressed_bytes >= chunk.original_bytes {
+            chunk.compressed_source = source.to_string();
+            chunk.dictionary.clear();
+            chunk.reverse_dictionary.clear();
+            chunk.compressed_bytes = chunk.original_bytes;
         }
+        chunk
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hydration_is_lossless_with_prefix_tokens() {
+        let registry = ChunkRegistry::new();
+        registry.register(CompressedChunk {
+            node_id: 7,
+            compressed_source: "$aa($a)".to_string(),
+            dictionary: HashMap::from([
+                ("long_function".to_string(), "$aa".to_string()),
+                ("long_value".to_string(), "$a".to_string()),
+            ]),
+            reverse_dictionary: HashMap::from([
+                ("$aa".to_string(), "long_function".to_string()),
+                ("$a".to_string(), "long_value".to_string()),
+            ]),
+            original_bytes: 30,
+            compressed_bytes: 7,
+        });
+        assert_eq!(registry.hydrate(7).as_deref(), Some("long_function(long_value)"));
+    }
+
+    #[test]
+    fn only_reports_real_prompt_savings() {
+        let repeated = "very_long_identifier ".repeat(30);
+        let mut compressor = ChunkCompressor::new();
+        let chunk = compressor.compress_source(&repeated);
+        assert!(chunk.compressed_bytes < chunk.original_bytes);
+        assert!(chunk.bytes_saved() > 0);
+        assert!(chunk.prompt_text().contains("very_long_identifier"));
+    }
+
+    #[test]
+    fn short_one_off_identifiers_are_left_alone() {
+        let source = "fn once() { let value = 1; }";
+        let mut compressor = ChunkCompressor::new();
+        let chunk = compressor.compress_source(source);
+        assert_eq!(chunk.prompt_text(), source);
+        assert_eq!(chunk.bytes_saved(), 0);
+    }
+
+    #[test]
+    fn token_generator_scales_past_two_character_space() {
+        let mut generator = TokenGenerator::new();
+        let mut last = String::new();
+        for _ in 0..4_000 {
+            last = generator.next_token();
+        }
+        assert!(last.starts_with('$'));
+        assert_eq!(generator.used_tokens.len(), 4_000);
     }
 }

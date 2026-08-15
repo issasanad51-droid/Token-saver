@@ -29,6 +29,8 @@ pub use vector::{MemoryVectorStore, ObfuscatedChunk, Obfuscator, SyncReport, Vec
 
 use std::path::Path;
 
+use rand::RngCore as _;
+
 /// A fully assembled AST index for a workspace.
 pub struct IndexBundle {
     /// All chunks extracted from the workspace.
@@ -58,8 +60,11 @@ pub fn index_workspace(dir: &Path) -> anyhow::Result<IndexBundle> {
     let mut trigram = TrigramIndex::new(3);
     trigram.index(&chunks);
 
-    // Demo key — load from an env var / secret store in production.
-    let key = [0u8; 32];
+    // Per-process random key. Production callers that need persistence can
+    // construct `VectorSync` directly with a key from their secret store; a
+    // hard-coded all-zero key must never be the default.
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
     let store = MemoryVectorStore::default();
     let mut sync = VectorSync::new(&key, store)?;
     let report = sync.sync(&chunks)?;
@@ -100,15 +105,16 @@ pub fn incremental_sync(
 
     // Re-sync only the changed chunks to the vector store.
     let changed: Vec<AstChunk> = new_chunks
-        .into_iter()
+        .iter()
         .filter(|c| diff.changed.contains(&c.id))
+        .cloned()
         .collect();
     bundle.sync.sync(&changed)?;
     bundle.sync.delete(&diff.deleted)?;
 
-    // Adopt the new tree + chunk set.
+    // Adopt the new tree + chunk set without parsing the workspace twice.
     bundle.merkle = new_merkle;
-    bundle.chunks = chunker.chunk_dir(dir)?;
+    bundle.chunks = new_chunks;
 
     Ok(diff)
 }

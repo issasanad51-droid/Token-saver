@@ -187,7 +187,16 @@ impl AstChunker {
     /// Chunk every `.rs` file under `dir`.
     pub fn chunk_dir(&mut self, dir: &Path) -> anyhow::Result<Vec<AstChunk>> {
         let mut chunks = Vec::new();
-        for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+        let walker = walkdir::WalkDir::new(dir).into_iter().filter_entry(|entry| {
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            !matches!(
+                entry.file_name().to_string_lossy().as_ref(),
+                ".git" | "target" | "node_modules" | ".cache" | ".idea" | ".vscode"
+            )
+        });
+        for entry in walker.filter_map(Result::ok) {
             let path = entry.path();
             if entry.file_type().is_file() && path.extension().map_or(false, |e| e == "rs") {
                 let source = std::fs::read_to_string(path)?;

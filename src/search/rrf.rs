@@ -8,10 +8,10 @@
 //!    semantic vector stream more than the lexical BM25 stream (e.g.
 //!    `weights = [1.2, 1.0, 0.9]`). With `weights = [1, 1, 1]` and
 //!    `score_alpha = 0` this reduces to the exact spec formula.
-//! 2. **Score-aware blending.** Raw scores (min-max normalized per stream) are
-//!    folded in via `score_alpha`. Two documents at adjacent ranks but with
-//!    wildly different raw scores are now distinguished — this is a well-known
-//!    RRF weakness that score blending repairs.
+//! 2. **Score-aware blending.** Raw scores (min-max normalized per stream)
+//!    scale each rank contribution by up to `1 + score_alpha`. This preserves
+//!    RRF's rank-first behavior instead of letting a differently-scaled raw
+//!    score overwhelm all reciprocal-rank evidence.
 //!
 //! Generic over document ids so it works with both the legacy `usize` pipeline
 //! and the v2 `NodeId` tracker.
@@ -51,6 +51,7 @@ pub struct FusedDoc<Id> {
 
 /// Fusion parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RrfConfig {
     /// Rank offset constant (spec default: 60).
     pub k: f64,
@@ -87,71 +88,106 @@ pub fn fuse<Id: Clone + Eq + Hash>(
         return Vec::new();
     }
 
+    let k = if config.k.is_finite() {
+        config.k.max(1.0)
+    } else {
+        60.0
+    };
+    let alpha = if config.score_alpha.is_finite() {
+        config.score_alpha.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let ws: Vec<f64> = if config.weights.len() == n_streams {
-        config.weights.clone()
+        config
+            .weights
+            .iter()
+            .map(|weight| {
+                if weight.is_finite() {
+                    weight.max(0.0)
+                } else {
+                    0.0
+                }
+            })
+            .collect()
     } else {
         vec![1.0; n_streams]
     };
 
-    // Per-stream min/max for normalization.
-    let ranges: Vec<(f64, f64)> = streams
+    // Per-stream min/max for confidence normalization. Ignore NaNs rather than
+    // allowing one bad backend score to poison the complete fusion.
+    let ranges: Vec<Option<(f64, f64)>> = streams
         .iter()
-        .map(|s| {
+        .map(|stream| {
             let mut min = f64::INFINITY;
             let mut max = f64::NEG_INFINITY;
-            for d in s {
-                min = min.min(d.score);
-                max = max.max(d.score);
+            for doc in stream.iter().filter(|doc| doc.score.is_finite()) {
+                min = min.min(doc.score);
+                max = max.max(doc.score);
             }
-            (min, max)
+            (min.is_finite() && max.is_finite()).then_some((min, max))
         })
         .collect();
 
-    let mut acc: HashMap<Id, (f64, Vec<f64>, Vec<Option<f64>>)> = HashMap::new();
+    // The ordinal makes exact ties deterministic despite HashMap's randomized
+    // iteration order.
+    let mut next_ordinal = 0usize;
+    let mut acc: HashMap<Id, (f64, Vec<f64>, Vec<Option<f64>>, usize)> = HashMap::new();
 
-    for (si, stream) in streams.iter().enumerate() {
-        let w = ws[si];
-        let (min, max) = ranges[si];
-        let span = max - min;
-
+    for (stream_index, stream) in streams.iter().enumerate() {
+        let weight = ws[stream_index];
         for (rank, doc) in stream.iter().enumerate() {
-            let entry = acc
-                .entry(doc.id.clone())
-                .or_insert_with(|| (0.0, vec![0.0; n_streams], vec![None; n_streams]));
+            let entry = acc.entry(doc.id.clone()).or_insert_with(|| {
+                let ordinal = next_ordinal;
+                next_ordinal += 1;
+                (
+                    0.0,
+                    vec![0.0; n_streams],
+                    vec![None; n_streams],
+                    ordinal,
+                )
+            });
 
-            // If the doc appears twice in one stream, keep the best (first) rank.
-            if entry.1[si] != 0.0 {
+            // If a backend accidentally emits a duplicate, retain its first
+            // (therefore best) rank even when the stream weight is zero.
+            if entry.2[stream_index].is_some() {
                 continue;
             }
 
-            let rrf = w / (config.k + rank as f64);
-            entry.0 += rrf;
-            entry.1[si] = rrf;
-            entry.2[si] = Some(doc.score);
+            let base = weight / (k + rank as f64);
+            let normalized = match (ranges[stream_index], doc.score.is_finite()) {
+                (Some((min, max)), true) if max > min => (doc.score - min) / (max - min),
+                _ => 0.0,
+            };
+            let contribution = base * (1.0 + alpha * normalized.clamp(0.0, 1.0));
 
-            if config.score_alpha > 0.0 && span > 0.0 {
-                let normalized = (doc.score - min) / span;
-                entry.0 += config.score_alpha * w * normalized;
-            }
+            entry.0 += contribution;
+            entry.1[stream_index] = contribution;
+            entry.2[stream_index] = Some(doc.score);
         }
     }
 
-    let mut out: Vec<FusedDoc<Id>> = acc
+    let mut with_order: Vec<(FusedDoc<Id>, usize)> = acc
         .into_iter()
-        .map(|(id, (fused_score, rrf_contributions, raw_scores))| FusedDoc {
-            id,
-            fused_score,
-            rrf_contributions,
-            raw_scores,
+        .map(|(id, (fused_score, rrf_contributions, raw_scores, ordinal))| {
+            (
+                FusedDoc {
+                    id,
+                    fused_score,
+                    rrf_contributions,
+                    raw_scores,
+                },
+                ordinal,
+            )
         })
         .collect();
 
-    out.sort_by(|a, b| {
+    with_order.sort_by(|(a, a_order), (b, b_order)| {
         b.fused_score
-            .partial_cmp(&a.fused_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&a.fused_score)
+            .then_with(|| a_order.cmp(b_order))
     });
-    out
+    with_order.into_iter().map(|(doc, _)| doc).collect()
 }
 
 /// Convenience for the canonical 3-stream pipeline

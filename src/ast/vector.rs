@@ -26,6 +26,8 @@ use crate::ast::chunker::AstChunk;
 /// Encrypts chunk bodies and hashes file paths before they leave the machine.
 pub struct Obfuscator {
     cipher: Aes256Gcm,
+    /// Secret salt prevents dictionary attacks against predictable file paths.
+    alias_salt: [u8; 32],
     /// Cache mapping real file paths to stable opaque aliases.
     file_alias: HashMap<PathBuf, String>,
 }
@@ -36,6 +38,7 @@ impl Obfuscator {
         let cipher = Aes256Gcm::new(key.into());
         Ok(Self {
             cipher,
+            alias_salt: *key,
             file_alias: HashMap::new(),
         })
     }
@@ -47,6 +50,7 @@ impl Obfuscator {
             return alias.clone();
         }
         let mut hasher = Sha256::new();
+        hasher.update(self.alias_salt);
         hasher.update(path.to_string_lossy().as_bytes());
         let alias = format!("f_{:x}", hasher.finalize());
         self.file_alias.insert(path.to_path_buf(), alias.clone());

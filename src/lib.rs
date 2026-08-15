@@ -3,6 +3,7 @@ pub mod ast;
 pub mod compressor;
 pub mod search;
 pub mod tracker;
+pub mod config;
 pub mod server;
 
 pub use asg::*;
@@ -10,4 +11,5 @@ pub use ast::*;
 pub use compressor::*;
 pub use search::*;
 pub use tracker::*;
+pub use config::*;
 pub use server::*;
