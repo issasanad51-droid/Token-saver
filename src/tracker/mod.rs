@@ -244,10 +244,26 @@ impl ContextTracker {
     }
 }
 
+/// Estimate the number of LLM tokens in a text string.
+///
+/// Code tokenizes differently from natural language: punctuation-heavy syntax
+/// (e.g. `let x: Vec<Arc<Mutex<T>>> = ...`) produces many more tokens per
+/// byte than prose. We use a conservative 3.2 bytes/token ratio for code
+/// (vs. ~4 for natural language) and count special characters that tend to
+/// each consume a full token (brackets, colons, arrows, semicolons).
 fn estimate_tokens(text: &str) -> usize {
-    // Conservative and model-independent: most source tokenizers average
-    // between 3 and 4 bytes/token.
-    text.len().saturating_add(3) / 4
+    if text.is_empty() {
+        return 0;
+    }
+    let base = (text.len() as f64 / 3.2).ceil() as usize;
+    // Count syntax-heavy characters that typically become standalone tokens.
+    let standalone: usize = text
+        .chars()
+        .filter(|c| matches!(c, '{' | '}' | '(' | ')' | '[' | ']' | ':' | ';' | ',' | '=' | '<' | '>' | '&' | '|' | '#' | '@'))
+        .count();
+    // Each standalone char adds ~0.3 tokens on top of the base estimate
+    // (they're partially covered by the byte ratio but undercounted).
+    base.max(standalone / 3).max(1)
 }
 
 // ---------------------------------------------------------------------------

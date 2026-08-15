@@ -104,8 +104,9 @@ fn build_recursive(mut nodes: Vec<MerkleNode>) -> Option<MerkleNode> {
         let left = nodes[i].clone();
         if i + 1 < nodes.len() {
             let right = nodes[i + 1].clone();
-            let combined = format!("{}{}", left.hash, right.hash);
-            let hash = hash_str(&combined);
+            // Hash both children incrementally to prevent collision:
+            // format!("{}{}") has ambiguity ("ab"+"cd" == "a"+"bcd").
+            let hash = hash_pair(&left.hash, &right.hash);
             next_level.push(MerkleNode {
                 hash,
                 left: Some(Box::new(left)),
@@ -121,9 +122,15 @@ fn build_recursive(mut nodes: Vec<MerkleNode>) -> Option<MerkleNode> {
     build_recursive(next_level)
 }
 
-fn hash_str(s: &str) -> String {
+/// Hash two strings incrementally with a length delimiter to prevent
+/// concatenation ambiguity (e.g. "ab"+"cd" vs "a"+"bcd").
+fn hash_pair(left: &str, right: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
+    // Encode the length of left before its bytes so the boundary is
+    // unambiguous — no allocation, no format!().
+    hasher.update(&(left.len() as u64).to_le_bytes());
+    hasher.update(left.as_bytes());
+    hasher.update(right.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 

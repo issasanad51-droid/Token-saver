@@ -5,6 +5,10 @@ pub mod search;
 pub mod tracker;
 pub mod config;
 pub mod server;
+pub mod memory;
+pub mod mcp;
+pub mod watcher;
+pub mod persistence;
 
 pub use asg::*;
 pub use ast::*;
@@ -13,3 +17,7 @@ pub use search::*;
 pub use tracker::*;
 pub use config::*;
 pub use server::*;
+pub use memory::*;
+pub use mcp::*;
+pub use watcher::*;
+pub use persistence::*;

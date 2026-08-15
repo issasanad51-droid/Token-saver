@@ -15,6 +15,7 @@ pub mod rrf;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -98,6 +99,12 @@ pub struct SearchEngine {
     config: SearchConfig,
     /// Precomputed local feature vectors keyed by dense ASG node ID.
     embeddings: Arc<RwLock<HashMap<usize, Vec<f64>>>>,
+    /// Cached tokenized document terms for BM25 (node_id -> terms).
+    document_terms: Arc<RwLock<HashMap<usize, Vec<String>>>>,
+    /// Timestamp of last access for temporal decay.
+    last_access: Arc<std::sync::Mutex<Instant>>,
+    /// Temporal decay factor per second (default 0.995, half-life ~138s).
+    decay_factor: f64,
 }
 
 impl SearchEngine {
@@ -111,6 +118,9 @@ impl SearchEngine {
             registry: Arc::new(registry),
             config,
             embeddings: Arc::new(RwLock::new(HashMap::new())),
+            document_terms: Arc::new(RwLock::new(HashMap::new())),
+            last_access: Arc::new(std::sync::Mutex::new(Instant::now())),
+            decay_factor: 0.995,
         }
     }
 
@@ -118,15 +128,38 @@ impl SearchEngine {
         &self.config
     }
 
-    /// Precompute vectors once. The feature hasher is deterministic, local,
-    /// dependency-free, and gives exact identifiers substantially more weight
-    /// than fuzzy character trigrams.
+    /// Apply temporal decay to PPR scores so stale code fades over time.
+    /// Each score is multiplied by `decay_factor^elapsed_secs`.
+    pub fn apply_temporal_decay(&self, scores: &mut [f64]) {
+        let last = *self.last_access.lock().unwrap();
+        let elapsed = last.elapsed().as_secs_f64();
+        if elapsed <= 0.0 || !self.decay_factor.is_finite() {
+            return;
+        }
+        let decay = self.decay_factor.powf(elapsed);
+        for score in scores.iter_mut() {
+            *score *= decay;
+        }
+    }
+
+    /// Update the last access timestamp to now.
+    pub fn touch_access(&self) {
+        *self.last_access.lock().unwrap() = Instant::now();
+    }
+
+    /// Precompute vectors and document terms once. The feature hasher is
+    /// deterministic, local, dependency-free, and gives exact identifiers
+    /// substantially more weight than fuzzy character trigrams.
     pub async fn precompute_embeddings(&self) {
         let mut embeddings = self.embeddings.write().await;
+        let mut doc_terms = self.document_terms.write().await;
         embeddings.clear();
+        doc_terms.clear();
         for node in &self.asg.inner.nodes {
             if self.is_searchable(node.id) {
-                embeddings.insert(node.id, embed_text(&searchable_text(node)));
+                let ctx_text = contextual_text(node, &self.asg.inner);
+                embeddings.insert(node.id, embed_text(&ctx_text));
+                doc_terms.insert(node.id, tokenize(&ctx_text));
             }
         }
     }
@@ -151,6 +184,8 @@ impl SearchEngine {
         if self.embeddings.read().await.is_empty() {
             self.precompute_embeddings().await;
         }
+
+        self.touch_access();
 
         let pool_size = top_k
             .saturating_mul(self.config.candidate_multiplier.max(1))
@@ -183,15 +218,18 @@ impl SearchEngine {
         let lexical_query = query.to_owned();
         let k1 = self.config.bm25_k1;
         let b = self.config.bm25_b;
+        let lexical_document_terms = self.document_terms.clone();
         let lexical_task = tokio::spawn(async move {
             Self::bm25_search(
                 lexical_asg,
                 lexical_registry,
+                lexical_document_terms,
                 &lexical_query,
                 k1,
                 b,
                 pool_size,
             )
+            .await
         });
 
         let semantic = semantic_task.await.unwrap_or_default();
@@ -201,6 +239,8 @@ impl SearchEngine {
         let structural_asg = self.asg.clone();
         let structural_registry = self.registry.clone();
         let ppr_config = self.config.ppr.clone();
+        let decay_factor = self.decay_factor;
+        let last_access = self.last_access.clone();
         let structural = tokio::task::spawn_blocking(move || {
             Self::structural_search(
                 structural_asg,
@@ -208,6 +248,8 @@ impl SearchEngine {
                 ppr_config,
                 seeds,
                 pool_size,
+                decay_factor,
+                last_access,
             )
         })
         .await
@@ -256,9 +298,10 @@ impl SearchEngine {
     // BM25 stream
     // -----------------------------------------------------------------------
 
-    fn bm25_search(
+    async fn bm25_search(
         asg: SharedAsg,
         registry: Arc<ChunkRegistry>,
+        document_terms_cache: Arc<RwLock<HashMap<usize, Vec<String>>>>,
         query: &str,
         configured_k1: f64,
         configured_b: f64,
@@ -270,13 +313,32 @@ impl SearchEngine {
         }
         let unique_query: HashSet<&str> = query_terms.iter().map(String::as_str).collect();
 
-        let documents: Vec<(usize, Vec<String>)> = asg
-            .inner
-            .nodes
-            .iter()
-            .filter(|node| registry.chunks.contains_key(&node.id))
-            .map(|node| (node.id, tokenize(&searchable_text(node))))
-            .collect();
+        // Use cached document terms if available, otherwise fall back to
+        // re-tokenizing from searchable text.
+        let cached = document_terms_cache.read().await;
+        let documents: Vec<(usize, Vec<String>)> = if !cached.is_empty() {
+            asg.inner
+                .nodes
+                .iter()
+                .filter(|node| registry.chunks.contains_key(&node.id))
+                .filter_map(|node| {
+                    cached
+                        .get(&node.id)
+                        .map(|terms| (node.id, terms.clone()))
+                })
+                .collect()
+        } else {
+            drop(cached);
+            asg.inner
+                .nodes
+                .iter()
+                .filter(|node| registry.chunks.contains_key(&node.id))
+                .map(|node| {
+                    let ctx_text = contextual_text(node, &asg.inner);
+                    (node.id, tokenize(&ctx_text))
+                })
+                .collect()
+        };
         if documents.is_empty() {
             return Vec::new();
         }
@@ -382,9 +444,25 @@ impl SearchEngine {
         config: PersonalizedPageRankConfig,
         seeds: Vec<(usize, f64)>,
         top_k: usize,
+        decay_factor: f64,
+        last_access: Arc<std::sync::Mutex<Instant>>,
     ) -> Vec<SearchResult> {
         let engine = PageRankEngine::from_config(config);
         let scores = engine.personalized_scores(&asg.inner, &seeds);
+
+        // Apply temporal decay to PPR scores so stale code fades over time.
+        let mut scores = scores;
+        {
+            let last = *last_access.lock().unwrap();
+            let elapsed = last.elapsed().as_secs_f64();
+            if elapsed > 0.0 && decay_factor.is_finite() {
+                let decay = decay_factor.powf(elapsed);
+                for score in scores.iter_mut() {
+                    *score *= decay;
+                }
+            }
+        }
+
         let mut results: Vec<SearchResult> = scores
             .into_iter()
             .enumerate()
@@ -456,12 +534,31 @@ impl SearchEngine {
 // ---------------------------------------------------------------------------
 
 fn searchable_text(node: &Node) -> String {
-    // Repeating the stable identity keeps exact symbol matches from being
-    // drowned out by a long function body while still indexing body concepts.
+    // Include tracker_id once (not the name three times), and include kind
+    // for type filtering. The body provides lexical coverage of internal
+    // concepts. Repeating the body boosts term frequency for code-internal
+    // identifiers without the fragile triple-name hack.
     format!(
-        "{} {} {} {} {}\n{}",
-        node.tracker_id, node.name, node.name, node.name, node.kind, node.source
+        "{} {} {}\n{}\n{}",
+        node.tracker_id, node.name, node.kind, node.source, node.source
     )
+}
+
+/// Contextual text wraps searchable_text with module context from the
+/// tracker_id hierarchy. This helps BM25 and semantic search understand
+/// what module a chunk belongs to.
+fn contextual_text(node: &Node, _asg: &crate::asg::Asg) -> String {
+    let base = searchable_text(node);
+    // Find the parent module by looking at the tracker_id hierarchy.
+    // e.g. "crate::server::mod::fn::handler" → parent module is "crate::server::mod"
+    let parts: Vec<&str> = node.tracker_id.split("::").collect();
+    if parts.len() > 2 {
+        // Include the module path as context prefix for BM25/semantic search.
+        let module_context = parts[..parts.len().saturating_sub(1)].join("::");
+        format!("[module: {}]\n{}", module_context, base)
+    } else {
+        base
+    }
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -510,13 +607,31 @@ fn embed_text(text: &str) -> Vec<f64> {
     vector
 }
 
+/// Double-hashing feature insertion eliminates systematic bias from
+/// single-hash collision patterns. The second hash (h2) provides an
+/// independent offset so that features with colliding h1 indices don't
+/// always collide on the same dimension.
 fn add_feature(vector: &mut [f64], feature: &str, weight: f64) {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    feature.hash(&mut hasher);
-    let hash = hasher.finish();
-    let index = hash as usize % vector.len();
-    let sign = if hash & (1 << 63) == 0 { 1.0 } else { -1.0 };
+    let mut hasher1 = std::collections::hash_map::DefaultHasher::new();
+    feature.hash(&mut hasher1);
+    let h1 = hasher1.finish();
+
+    let mut hasher2 = std::collections::hash_map::DefaultHasher::new();
+    // Offset the second hash with a different seed to ensure independence.
+    0x9e3779b97f4a7c15u64.hash(&mut hasher2);
+    feature.hash(&mut hasher2);
+    let h2 = hasher2.finish();
+
+    let dim = vector.len();
+    let index = (h1 as usize) % dim;
+    let sign = if h1 & (1 << 63) == 0 { 1.0 } else { -1.0 };
+    // Secondary dimension with h2-offset breaks systematic collision
+    // patterns between features that share the same primary index.
+    let index2 = ((h1 as usize).wrapping_add(h2 as usize)) % dim;
+    let sign2 = if h2 & (1 << 63) == 0 { 1.0 } else { -1.0 };
+
     vector[index] += sign * weight;
+    vector[index2] += sign2 * weight * 0.5;
 }
 
 fn cosine_similarity(left: &[f64], right: &[f64]) -> f64 {

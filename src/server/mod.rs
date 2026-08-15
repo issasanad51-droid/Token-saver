@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -18,6 +18,8 @@ use crate::asg::{Asg, SharedAsg};
 use crate::ast::{AstChunker, MerkleTree, TrigramIndex};
 use crate::compressor::ChunkRegistry;
 use crate::config::TokenSaverConfig;
+use crate::memory::MemoryStore;
+use crate::persistence::PersistentStore;
 use crate::search::SearchEngine;
 use crate::tracker::{ContextTracker, CursorPayload};
 
@@ -82,6 +84,47 @@ pub struct HealthResponse {
     pub compressed_chunks: usize,
     pub ast_chunks: usize,
     pub merkle_root: Option<String>,
+    pub memory_count: usize,
+}
+
+// Memory API types
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SaveMemoryRequest {
+    pub content: String,
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SaveMemoryResponse {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecallMemoryRequest {
+    pub query: String,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallMemoryResponse {
+    pub memories: Vec<crate::memory::Memory>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListMemoryResponse {
+    pub memories: Vec<crate::memory::Memory>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListMemoryQuery {
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForgetMemoryResponse {
+    pub forgotten: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +149,8 @@ pub struct ServerState {
     pub request_counter: Arc<AtomicU64>,
     pub workspace: Arc<std::path::PathBuf>,
     pub debounce_ms: u64,
+    pub memory_store: MemoryStore,
+    pub persistent_store: Option<Arc<PersistentStore>>,
 }
 
 impl ServerState {
@@ -159,6 +204,8 @@ impl ServerState {
             request_counter: Arc::new(AtomicU64::new(0)),
             workspace: Arc::new(workspace),
             debounce_ms: config.debounce_ms,
+            memory_store: MemoryStore::new(),
+            persistent_store: None,
         }
     }
 
@@ -236,18 +283,19 @@ impl IntoResponse for SseStream {
                 Some(chunk) => {
                     let is_done = chunk.done;
                     let json = serde_json::to_string(&chunk).unwrap_or_default();
-                    let frame = format!("data: {json}\n\n");
+                    let frame = format!("data: {}\n\n", json);
                     Some((
                         Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(frame)),
                         (rx, is_done),
                     ))
                 }
-                None => Some((
-                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                        "data: {\"text\":\"\",\"done\":true,\"node_id\":null,\"pagerank\":null}\n\n",
-                    )),
-                    (rx, true),
-                )),
+                None => {
+                    let final_event = "data: {\"text\":\"\",\"done\":true,\"node_id\":null,\"pagerank\":null}\n\n";
+                    Some((
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(final_event)),
+                        (rx, true),
+                    ))
+                }
             }
         });
 
@@ -433,7 +481,44 @@ pub async fn health_handler(State(state): State<ServerState>) -> impl IntoRespon
         compressed_chunks: state.registry.chunks.len(),
         ast_chunks: state.ast_trigram.len(),
         merkle_root: state.ast_merkle.root_hash(),
+        memory_count: state.memory_store.len(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Memory API handlers
+// ---------------------------------------------------------------------------
+
+pub async fn save_memory_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<SaveMemoryRequest>,
+) -> impl IntoResponse {
+    let id = state.memory_store.save(&request.content, request.namespace);
+    Json(SaveMemoryResponse { id })
+}
+
+pub async fn recall_memory_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<RecallMemoryRequest>,
+) -> impl IntoResponse {
+    let memories = state.memory_store.recall(&request.query, request.top_k);
+    Json(RecallMemoryResponse { memories })
+}
+
+pub async fn forget_memory_handler(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let forgotten = state.memory_store.forget(&id);
+    Json(ForgetMemoryResponse { forgotten })
+}
+
+pub async fn list_memory_handler(
+    State(state): State<ServerState>,
+    Query(query): Query<ListMemoryQuery>,
+) -> impl IntoResponse {
+    let memories = state.memory_store.list(query.namespace.as_deref());
+    Json(ListMemoryResponse { memories })
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +530,9 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/health", get(health_handler))
         .route("/v1/search", post(search_handler))
         .route("/v1/autocomplete", post(autocomplete_handler))
+        .route("/v1/memories", post(save_memory_handler).get(list_memory_handler))
+        .route("/v1/memories/recall", post(recall_memory_handler))
+        .route("/v1/memories/{id}", delete(forget_memory_handler))
         .with_state(state)
 }
 
@@ -456,10 +544,41 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
     let workspace = config.canonical_workspace()?;
     info!("indexing workspace {}", workspace.display());
 
-    let asg = crate::asg::build_asg_from_dir_with_config(
-        &workspace,
-        config.search.ppr.clone(),
-    )?;
+    // Try to load from persistent store first.
+    let db_path = workspace.join(".token-saver.db");
+    let persistent_store = if db_path.exists() {
+        match PersistentStore::open(&db_path) {
+            Ok(store) => {
+                info!("persistent store found at {}", db_path.display());
+                Some(store)
+            }
+            Err(e) => {
+                warn!("failed to open persistent store: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let asg = if let Some(ref store) = persistent_store {
+        match store.load_asg() {
+            Ok(Some(asg)) => {
+                info!("loaded ASG from persistent store: {} nodes, {} edges", asg.nodes.len(), asg.edges.len());
+                asg
+            }
+            Ok(None) => {
+                info!("no ASG in persistent store, building from source");
+                build_asg(&workspace, &config)?
+            }
+            Err(e) => {
+                warn!("failed to load ASG from persistent store: {e}");
+                build_asg(&workspace, &config)?
+            }
+        }
+    } else {
+        build_asg(&workspace, &config)?
+    };
     info!("semantic ASG ready: {} nodes, {} edges", asg.nodes.len(), asg.edges.len());
 
     let mut compressor = crate::compressor::ChunkCompressor::new();
@@ -490,17 +609,100 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
         ast_merkle.root_hash().unwrap_or_default()
     );
 
-    let state = ServerState::with_config(
+    // Load memory store from persistent storage.
+    let memory_store = if let Some(ref store) = persistent_store {
+        match store.load_memories() {
+            Ok(ms) => {
+                info!("loaded {} memories from persistent store", ms.len());
+                ms
+            }
+            Err(e) => {
+                warn!("failed to load memories from persistent store: {e}");
+                MemoryStore::new()
+            }
+        }
+    } else {
+        MemoryStore::new()
+    };
+
+    let mut state = ServerState::with_config(
         asg,
         registry,
         search_engine,
         ast_trigram,
         ast_merkle,
-        workspace,
+        workspace.clone(),
         &config,
     );
+    state.memory_store = memory_store;
+    state.persistent_store = persistent_store.map(Arc::new);
+
+    // Save to persistent store if available.
+    if let Some(ref store) = state.persistent_store {
+        if let Err(e) = store.save_asg(&state.asg.inner) {
+            warn!("failed to save ASG to persistent store: {e}");
+        }
+        if let Err(e) = store.save_memories(&state.memory_store) {
+            warn!("failed to save memories to persistent store: {e}");
+        }
+    }
+
+    // Start file watcher in the background.
+    let watcher_workspace = workspace.clone();
+    tokio::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        match crate::watcher::watch_workspace(watcher_workspace, tx).await {
+            Ok(()) => {
+                while rx.recv().await.is_some() {
+                    // File change events received; incremental re-indexing
+                    // would be triggered here via the Merkle diff pipeline.
+                    // For now, just log that changes are detected.
+                    debug!("file change detected, incremental re-indexing pending");
+                }
+            }
+            Err(e) => {
+                warn!("file watcher failed to start: {e}");
+            }
+        }
+    });
+
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     info!("Token Saver listening on http://{}", config.bind);
     axum::serve(listener, build_router(state)).await?;
     Ok(())
+}
+
+fn build_asg(workspace: &std::path::Path, config: &TokenSaverConfig) -> anyhow::Result<Asg> {
+    Ok(crate::asg::build_asg_from_dir_with_config(
+        workspace,
+        config.search.ppr.clone(),
+    )?)
+}
+
+/// Run the MCP server (for --mcp CLI flag). Loads config, builds the ASG,
+/// and starts the MCP JSON-RPC server over stdio.
+pub async fn run_mcp_server_with_config(config: TokenSaverConfig) -> anyhow::Result<()> {
+    let workspace = config.canonical_workspace()?;
+    info!("indexing workspace {} for MCP server", workspace.display());
+
+    let asg = crate::asg::build_asg_from_dir_with_config(
+        &workspace,
+        config.search.ppr.clone(),
+    )?;
+    info!("semantic ASG ready: {} nodes, {} edges", asg.nodes.len(), asg.edges.len());
+
+    let mut compressor = crate::compressor::ChunkCompressor::new();
+    let registry = compressor.compress_asg(&asg);
+
+    let shared_asg = SharedAsg::new(asg);
+    let search_engine = Arc::new(SearchEngine::with_config(
+        shared_asg.clone(),
+        registry,
+        config.search.clone(),
+    ));
+    search_engine.precompute_embeddings().await;
+
+    let memory_store = MemoryStore::new();
+
+    crate::mcp::run_mcp_server(search_engine, shared_asg, memory_store).await
 }

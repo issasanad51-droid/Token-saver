@@ -120,15 +120,12 @@ impl TrigramIndex {
             })
             .collect();
 
+        // Use total_cmp for deterministic bitwise ordering — partial_cmp
+        // returns None for NaN scores, making the sort non-deterministic.
         hits.sort_by(|a, b| {
             b.jaccard
-                .partial_cmp(&a.jaccard)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+                .total_cmp(&a.jaccard)
+                .then_with(|| b.score.total_cmp(&a.score))
         });
         hits.truncate(top_k);
         hits

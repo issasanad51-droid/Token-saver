@@ -48,7 +48,7 @@ pub enum EdgeKind {
 }
 
 /// A semantic node in the ASG.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Node {
     /// Dense runtime ID used by the low-latency retrieval path.
     pub id: usize,
@@ -63,7 +63,7 @@ pub struct Node {
 }
 
 /// A directed edge in the ASG.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Edge {
     pub from: usize,
     pub to: usize,
@@ -71,7 +71,7 @@ pub struct Edge {
 }
 
 /// The complete Abstract Semantic Graph.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Asg {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
