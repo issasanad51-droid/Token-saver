@@ -26,6 +26,10 @@ search:
       variant_of: 0.25
 
   # Custom RRF stream order: semantic, BM25, structural PPR.
+  # score_alpha injects the normalized raw confidence score into the rank
+  # denominator (effective_rank = rank × (1 − α × score)), so highly
+  # confident matches behave as if they appeared at a better rank.
+  # Set to 0.0 for stock RRF (rank-only). Range: [0.0, 1.0].
   rrf:
     k: 60.0
     weights: [1.15, 1.0, 1.1]

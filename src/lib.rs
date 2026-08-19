@@ -1,7 +1,12 @@
 pub mod asg;
 pub mod ast;
+pub mod bridge;
 pub mod compressor;
+pub mod diff;
+pub mod recency;
 pub mod search;
+pub mod slicer;
+pub mod tokenizer;
 pub mod tracker;
 pub mod config;
 pub mod server;
@@ -12,8 +17,13 @@ pub mod persistence;
 
 pub use asg::*;
 pub use ast::*;
+pub use bridge::*;
 pub use compressor::*;
+pub use diff::*;
+pub use recency::*;
 pub use search::*;
+pub use slicer::*;
+pub use tokenizer::*;
 pub use tracker::*;
 pub use config::*;
 pub use server::*;

@@ -21,9 +21,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::asg::{
-    Node, PageRankEngine, PersonalizedPageRankConfig, SharedAsg,
+    EdgeKind, Node, PageRankEngine, PersonalizedPageRankConfig, SharedAsg,
 };
 use crate::compressor::ChunkRegistry;
+use crate::recency::RecencyTracker;
 use rrf::{RankedDoc, RrfConfig};
 
 const STREAM_NAMES: [&str; 3] = ["semantic", "bm25", "structural"];
@@ -105,6 +106,9 @@ pub struct SearchEngine {
     last_access: Arc<std::sync::Mutex<Instant>>,
     /// Temporal decay factor per second (default 0.995, half-life ~138s).
     decay_factor: f64,
+    /// Sliding-window recency tracker that boosts recently touched nodes in
+    /// the PPR teleport vector.
+    recency: Arc<RecencyTracker>,
 }
 
 impl SearchEngine {
@@ -121,7 +125,18 @@ impl SearchEngine {
             document_terms: Arc::new(RwLock::new(HashMap::new())),
             last_access: Arc::new(std::sync::Mutex::new(Instant::now())),
             decay_factor: 0.995,
+            recency: Arc::new(RecencyTracker::new()),
         }
+    }
+
+    /// Attach a shared recency tracker so recently edited/queried nodes get a
+    /// temporary boost in the PPR teleport vector.
+    pub fn set_recency(&mut self, recency: Arc<RecencyTracker>) {
+        self.recency = recency;
+    }
+
+    pub fn recency(&self) -> &Arc<RecencyTracker> {
+        &self.recency
     }
 
     pub fn config(&self) -> &SearchConfig {
@@ -481,6 +496,47 @@ impl SearchEngine {
     }
 
     // -----------------------------------------------------------------------
+    // ASG structural dependency scores (for RRF tie-breaking)
+    // -----------------------------------------------------------------------
+
+    /// Compute per-node ASG structural dependency weights used as a
+    /// deterministic tie-breaker inside the RRF fusion.  Only weighted
+    /// incoming `calls` and `references` edges count — the two edge kinds
+    /// that carry genuine structural signal in a code graph (as opposed to
+    /// lexical `contains` nesting).
+    ///
+    /// Weights are taken from `search.ppr.edge_weights` so they stay
+    /// consistent with the PPR structural stream.
+    fn compute_structural_dependency_scores(&self) -> HashMap<usize, f64> {
+        let mut scores = HashMap::with_capacity(self.asg.inner.nodes.len());
+        for node in &self.asg.inner.nodes {
+            let weight: f64 = self
+                .asg
+                .inner
+                .reverse_adjacency
+                .get(&node.id)
+                .map(|edge_indices| {
+                    edge_indices
+                        .iter()
+                        .map(|&edge_idx| {
+                            let edge = &self.asg.inner.edges[edge_idx];
+                            match edge.kind {
+                                EdgeKind::Calls => self.config.ppr.edge_weights.calls,
+                                EdgeKind::References => self.config.ppr.edge_weights.references,
+                                // Only calls and references are true structural
+                                // dependencies; contains/imports/etc. are excluded.
+                                _ => 0.0,
+                            }
+                        })
+                        .sum()
+                })
+                .unwrap_or(0.0);
+            scores.insert(node.id, weight);
+        }
+        scores
+    }
+
+    // -----------------------------------------------------------------------
     // Custom RRF
     // -----------------------------------------------------------------------
 
@@ -502,28 +558,36 @@ impl SearchEngine {
             })
             .collect();
 
-        let mut merged: Vec<MergedResult> = rrf::fuse(&ranked_streams, &self.config.rrf)
-            .into_iter()
-            .map(|fused| {
-                let mut scores = HashMap::new();
-                let mut contributions = HashMap::new();
-                for index in 0..STREAM_NAMES.len() {
-                    if let Some(score) = fused.raw_scores[index] {
-                        scores.insert(STREAM_NAMES[index], score);
-                    }
-                    let contribution = fused.rrf_contributions[index];
-                    if contribution > 0.0 {
-                        contributions.insert(STREAM_NAMES[index], contribution);
-                    }
+        // Pre-compute per-node structural dependency weights so the RRF
+        // fusion can break ties deterministically via ASG topology.
+        let structural_dependency_scores = self.compute_structural_dependency_scores();
+
+        let mut merged: Vec<MergedResult> = rrf::fuse(
+            &ranked_streams,
+            &self.config.rrf,
+            Some(&structural_dependency_scores),
+        )
+        .into_iter()
+        .map(|fused| {
+            let mut scores = HashMap::new();
+            let mut contributions = HashMap::new();
+            for index in 0..STREAM_NAMES.len() {
+                if let Some(score) = fused.raw_scores[index] {
+                    scores.insert(STREAM_NAMES[index], score);
                 }
-                MergedResult {
-                    node_id: fused.id,
-                    rrf_score: fused.fused_score,
-                    scores,
-                    rrf_contributions: contributions,
+                let contribution = fused.rrf_contributions[index];
+                if contribution > 0.0 {
+                    contributions.insert(STREAM_NAMES[index], contribution);
                 }
-            })
-            .collect();
+            }
+            MergedResult {
+                node_id: fused.id,
+                rrf_score: fused.fused_score,
+                scores,
+                rrf_contributions: contributions,
+            }
+        })
+        .collect();
         merged.truncate(top_k);
         merged
     }

@@ -45,6 +45,8 @@ pub enum EdgeKind {
     FieldOf,
     /// A node is a variant of an enum.
     VariantOf,
+    /// A cross-language bridge edge (SQL query strings, API endpoints).
+    Bridge,
 }
 
 /// A semantic node in the ASG.
@@ -294,6 +296,7 @@ pub struct PageRankEdgeWeights {
     pub implements: f64,
     pub field_of: f64,
     pub variant_of: f64,
+    pub bridge: f64,
 }
 
 impl Default for PageRankEdgeWeights {
@@ -306,6 +309,7 @@ impl Default for PageRankEdgeWeights {
             implements: 0.9,
             field_of: 0.25,
             variant_of: 0.25,
+            bridge: 0.6,
         }
     }
 }
@@ -320,6 +324,7 @@ impl PageRankEdgeWeights {
             EdgeKind::Implements => self.implements,
             EdgeKind::FieldOf => self.field_of,
             EdgeKind::VariantOf => self.variant_of,
+            EdgeKind::Bridge => self.bridge,
         };
         if weight.is_finite() {
             weight.max(0.0)
@@ -529,6 +534,12 @@ pub fn build_asg_from_dir_with_config(
     semantic_builder.parse()?;
     let semantic = semantic_builder.build();
     let mut runtime = runtime_graph(&semantic);
+    // Cross-language semantic bridge edges (SQL strings, API endpoints).
+    let bridge_mapper = crate::bridge::BridgeMapper::new();
+    let bridge_edges = bridge_mapper.link_bridges(&mut runtime);
+    if bridge_edges > 0 {
+        tracing::debug!("linked {bridge_edges} cross-language bridge edges");
+    }
     PageRankEngine::from_config(pagerank).run(&mut runtime);
     Ok(runtime)
 }
