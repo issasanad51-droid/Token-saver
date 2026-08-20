@@ -36,11 +36,17 @@ impl SharedIndexes {
 }
 
 /// Stats reported after each re-index cycle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReindexReport {
     pub files_processed: usize,
     pub chunks_added: usize,
+    /// Chunks physically removed from the trigram index (i.e. belonged to
+    /// files that were deleted or modified).
     pub chunks_removed: usize,
+    /// Chunks whose content hash changed between the old and new Merkle tree.
+    /// This is distinct from `chunks_removed` — a modified file may produce
+    /// the same number of chunks (so `chunks_removed` is 0) but every chunk
+    /// has a new hash (so `chunks_changed` is N).
     pub chunks_changed: usize,
 }
 
@@ -52,7 +58,11 @@ pub async fn run_reindex_worker(
     mut rx: mpsc::UnboundedReceiver<FileChangeEvent>,
     debounce: Duration,
 ) {
-    info!("reindex worker started for {} (debounce: {}ms)", workspace.display(), debounce.as_millis());
+    info!(
+        "reindex worker started for {} (debounce: {}ms)",
+        workspace.display(),
+        debounce.as_millis()
+    );
 
     loop {
         // Wait for the first event.
@@ -97,7 +107,10 @@ pub async fn run_reindex_worker(
         let report = apply_incremental_update(&workspace, &indexes, &changes).await;
         info!(
             "reindex cycle complete: {} files, {} added, {} removed, {} changed",
-            report.files_processed, report.chunks_added, report.chunks_removed, report.chunks_changed
+            report.files_processed,
+            report.chunks_added,
+            report.chunks_removed,
+            report.chunks_changed
         );
     }
 }
@@ -108,12 +121,7 @@ async fn apply_incremental_update(
     indexes: &SharedIndexes,
     changes: &HashSet<(PathBuf, ChangeKind)>,
 ) -> ReindexReport {
-    let mut report = ReindexReport {
-        files_processed: 0,
-        chunks_added: 0,
-        chunks_removed: 0,
-        chunks_changed: 0,
-    };
+    let mut report = ReindexReport::default();
 
     let mut chunker = match AstChunker::new() {
         Ok(c) => c.with_crate_root(workspace),
@@ -199,14 +207,22 @@ async fn apply_incremental_update(
         drop(old_merkle);
 
         report.chunks_changed = diff.changed.len();
-        report.chunks_removed = diff.deleted.len();
+        // Note: do NOT overwrite `chunks_removed` with `diff.deleted.len()`.
+        // The previous implementation did that, which meant the report's
+        // `chunks_removed` reflected only Merkle-tree deletions and erased
+        // the trigram-index removal count computed above. The two numbers
+        // are different signals — trigram removals count every chunk that
+        // was pulled out of the lexical index (file modified OR deleted),
+        // while `diff.deleted` counts only chunks that disappeared entirely
+        // from the rebuilt Merkle tree. Keep both fields separate.
+        let merkle_deleted = diff.deleted.len();
 
         *indexes.merkle.write().await = new_merkle;
 
         debug!(
             "merkle diff: {} changed, {} deleted",
             diff.changed.len(),
-            diff.deleted.len()
+            merkle_deleted
         );
     }
 

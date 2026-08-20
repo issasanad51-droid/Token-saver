@@ -25,7 +25,9 @@ pub mod vector;
 pub use chunker::{AstChunk, AstChunker, ChunkKind};
 pub use merkle::{DiffResult, MerkleTree};
 pub use trigram::{TrigramHit, TrigramIndex};
-pub use vector::{MemoryVectorStore, ObfuscatedChunk, Obfuscator, SyncReport, VectorStore, VectorSync};
+pub use vector::{
+    MemoryVectorStore, ObfuscatedChunk, Obfuscator, SyncReport, VectorStore, VectorSync,
+};
 
 use std::path::Path;
 
@@ -83,10 +85,7 @@ pub fn index_workspace(dir: &Path) -> anyhow::Result<IndexBundle> {
 /// Re-chunks the directory, diffs the new Merkle tree against the previous
 /// one, and pushes only the `changed` chunks (plus purges the `deleted`
 /// ones). This is the incremental path Cursor walks every ~10 minutes.
-pub fn incremental_sync(
-    bundle: &mut IndexBundle,
-    dir: &Path,
-) -> anyhow::Result<DiffResult> {
+pub fn incremental_sync(bundle: &mut IndexBundle, dir: &Path) -> anyhow::Result<DiffResult> {
     let mut chunker = AstChunker::new()?;
     let new_chunks = chunker.chunk_dir(dir)?;
 

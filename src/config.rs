@@ -124,17 +124,17 @@ mod tests {
     fn resolve_db_path_uses_default() {
         let config = TokenSaverConfig::default();
         // Default workspace is "." so db path is "./.token-saver.db"
-        assert!(config.resolve_db_path().to_string_lossy().ends_with(".token-saver.db"));
+        assert!(config
+            .resolve_db_path()
+            .to_string_lossy()
+            .ends_with(".token-saver.db"));
     }
 
     #[test]
     fn resolve_db_path_uses_explicit() {
         let mut config = TokenSaverConfig::default();
         config.db_path = Some(PathBuf::from("/custom/path.db"));
-        assert_eq!(
-            config.resolve_db_path(),
-            PathBuf::from("/custom/path.db")
-        );
+        assert_eq!(config.resolve_db_path(), PathBuf::from("/custom/path.db"));
     }
 
     #[test]

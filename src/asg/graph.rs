@@ -424,10 +424,7 @@ impl<'a> AsgGraph<'a> {
             })
             .collect();
 
-        AsgGraphSnapshot {
-            version: 1,
-            nodes,
-        }
+        AsgGraphSnapshot { version: 1, nodes }
     }
 
     /// Serialize the full graph to compact YAML.
@@ -572,8 +569,7 @@ mod tests {
 
         g.add_edge(&fn_id, &struct_id, EdgeKind::References)
             .unwrap();
-        g.add_edge(&fn_id, &trait_id, EdgeKind::Implements)
-            .unwrap();
+        g.add_edge(&fn_id, &trait_id, EdgeKind::Implements).unwrap();
         g
     }
 
@@ -630,7 +626,8 @@ mod tests {
     fn duplicate_id_rejected() {
         let mut g = AsgGraph::new();
         let id = NodeId::qualified("crate", &[], "fn", "x");
-        g.add_node(id.clone(), NodeType::Fn, Cow::Borrowed("a")).unwrap();
+        g.add_node(id.clone(), NodeType::Fn, Cow::Borrowed("a"))
+            .unwrap();
         assert!(matches!(
             g.add_node(id, NodeType::Fn, Cow::Borrowed("b")),
             Err(AsgGraphError::DuplicateNode(_))

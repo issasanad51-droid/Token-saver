@@ -140,12 +140,7 @@ pub fn fuse<Id: Clone + Eq + Hash>(
             let entry = acc.entry(doc.id.clone()).or_insert_with(|| {
                 let ordinal = next_ordinal;
                 next_ordinal += 1;
-                (
-                    0.0,
-                    vec![0.0; n_streams],
-                    vec![None; n_streams],
-                    ordinal,
-                )
+                (0.0, vec![0.0; n_streams], vec![None; n_streams], ordinal)
             });
 
             // If a backend accidentally emits a duplicate, retain its first
@@ -169,17 +164,19 @@ pub fn fuse<Id: Clone + Eq + Hash>(
 
     let mut with_order: Vec<(FusedDoc<Id>, usize)> = acc
         .into_iter()
-        .map(|(id, (fused_score, rrf_contributions, raw_scores, ordinal))| {
-            (
-                FusedDoc {
-                    id,
-                    fused_score,
-                    rrf_contributions,
-                    raw_scores,
-                },
-                ordinal,
-            )
-        })
+        .map(
+            |(id, (fused_score, rrf_contributions, raw_scores, ordinal))| {
+                (
+                    FusedDoc {
+                        id,
+                        fused_score,
+                        rrf_contributions,
+                        raw_scores,
+                    },
+                    ordinal,
+                )
+            },
+        )
         .collect();
 
     with_order.sort_by(|(a, a_order), (b, b_order)| {

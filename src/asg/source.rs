@@ -67,15 +67,17 @@ impl SourceSet {
     /// Recursively load every file with the given extension under `dir`.
     pub fn from_dir(dir: &Path, ext: &str) -> std::io::Result<Self> {
         let mut set = Self::new();
-        let walker = walkdir::WalkDir::new(dir).into_iter().filter_entry(|entry| {
-            if !entry.file_type().is_dir() {
-                return true;
-            }
-            !matches!(
-                entry.file_name().to_string_lossy().as_ref(),
-                ".git" | "target" | "node_modules" | ".cache" | ".idea" | ".vscode"
-            )
-        });
+        let walker = walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_entry(|entry| {
+                if !entry.file_type().is_dir() {
+                    return true;
+                }
+                !matches!(
+                    entry.file_name().to_string_lossy().as_ref(),
+                    ".git" | "target" | "node_modules" | ".cache" | ".idea" | ".vscode"
+                )
+            });
         for entry in walker.filter_map(Result::ok) {
             let path = entry.path();
             if entry.file_type().is_file() && path.extension().map_or(false, |e| e == ext) {
@@ -108,7 +110,10 @@ mod tests {
 
         // Insert enough files to force the HashMap index to rehash repeatedly.
         for i in 0..2048 {
-            sources.insert(PathBuf::from(format!("f{i}.rs")), format!("pub fn f{i}() {{}}"));
+            sources.insert(
+                PathBuf::from(format!("f{i}.rs")),
+                format!("pub fn f{i}() {{}}"),
+            );
         }
 
         // The Box<str> payload is heap-pinned: rehashing moves only the pointer
@@ -127,13 +132,19 @@ mod tests {
     fn borrow_slices_after_bulk_insert() {
         let mut sources = SourceSet::new();
         for i in 0..2048 {
-            sources.insert(PathBuf::from(format!("f{i}.rs")), format!("pub fn f{i}() {{}}"));
+            sources.insert(
+                PathBuf::from(format!("f{i}.rs")),
+                format!("pub fn f{i}() {{}}"),
+            );
         }
 
         // Rehash has long since happened; borrows are still coherent.
         let first = sources.get(Path::new("f0.rs")).unwrap();
         assert_eq!(first, "pub fn f0() {}");
-        assert_eq!(sources.get(Path::new("f2047.rs")), Some("pub fn f2047() {}"));
+        assert_eq!(
+            sources.get(Path::new("f2047.rs")),
+            Some("pub fn f2047() {}")
+        );
     }
 
     #[test]

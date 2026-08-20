@@ -8,8 +8,8 @@
 //! - Temporal decay: older and less-accessed memories fade over time
 //! - Namespace scoping: memories can be tagged with a namespace
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,12 @@ impl MemoryStore {
     /// If `importance` is provided, it is clamped to [0.0, 1.0].
     /// Otherwise, importance is auto-calculated based on content length
     /// and namespace presence.
-    pub fn save(&self, content: &str, namespace: Option<String>, importance: Option<f64>) -> String {
+    pub fn save(
+        &self,
+        content: &str,
+        namespace: Option<String>,
+        importance: Option<f64>,
+    ) -> String {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let id = format!(
             "mem_{}_{}",
@@ -127,9 +132,20 @@ impl MemoryStore {
     }
 
     /// Recall memories matching a query (keyword matching + importance + decay).
+    ///
+    /// Recall also updates each returned memory's access metadata
+    /// (`access_count`, `last_accessed`) so frequently-recalled memories
+    /// earn a meaningful frequency/recency boost in subsequent `decay_factor`
+    /// computations. The previous implementation left recalled memories'
+    /// access stats untouched, so the `freq_boost` term was effectively a
+    /// constant and the `recency_boost` only ever fired for `get()` calls.
     pub fn recall(&self, query: &str, top_k: usize) -> Vec<Memory> {
         let query_lower = query.to_lowercase();
         let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let mut scored: Vec<(f64, Memory)> = self
             .memories
             .iter()
@@ -152,6 +168,14 @@ impl MemoryStore {
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
         scored.truncate(top_k);
+        // Bump access metadata for the memories we actually returned so the
+        // next `decay_factor` reflects this recall.
+        for (_, mem) in &scored {
+            if let Some(mut entry) = self.memories.get_mut(&mem.id) {
+                entry.access_count += 1;
+                entry.last_accessed = now;
+            }
+        }
         scored.into_iter().map(|(_, m)| m).collect()
     }
 
@@ -162,7 +186,12 @@ impl MemoryStore {
 
     /// Update an existing memory's importance and/or namespace.
     /// Returns true if the memory was found and updated.
-    pub fn update(&self, id: &str, importance: Option<f64>, namespace: Option<Option<String>>) -> bool {
+    pub fn update(
+        &self,
+        id: &str,
+        importance: Option<f64>,
+        namespace: Option<Option<String>>,
+    ) -> bool {
         if let Some(mut mem) = self.memories.get_mut(id) {
             if let Some(imp) = importance {
                 mem.importance = imp.clamp(0.0, 1.0);
@@ -246,7 +275,11 @@ mod tests {
     #[test]
     fn auto_importance_for_namespaced_memory() {
         let store = MemoryStore::new();
-        let id = store.save("This is a design decision about auth", Some("project:auth".to_string()), None);
+        let id = store.save(
+            "This is a design decision about auth",
+            Some("project:auth".to_string()),
+            None,
+        );
         let mem = store.get(&id).unwrap();
         // Namespaced + reasonable length should be > 0.5
         assert!(mem.importance > 0.5);
@@ -276,12 +309,45 @@ mod tests {
     #[test]
     fn recall_uses_decay_scoring() {
         let store = MemoryStore::new();
-        store.save("important auth decision", Some("auth".to_string()), Some(1.0));
+        store.save(
+            "important auth decision",
+            Some("auth".to_string()),
+            Some(1.0),
+        );
         store.save("minor note", None, Some(0.1));
 
         let results = store.recall("auth", 10);
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("auth"));
+    }
+
+    /// Regression test: `recall` previously did not update the access_count
+    /// or last_accessed fields, so frequently-recalled memories never earned
+    /// the frequency/recency boost that `decay_factor` is supposed to apply.
+    /// The fix makes `recall` bump access metadata on every matched memory.
+    #[test]
+    fn recall_bumps_access_metadata() {
+        let store = MemoryStore::new();
+        let id = store.save("alpha memory", None, Some(0.5));
+        // Sanity: never accessed yet.
+        let initial = store.list(None)[0].clone();
+        assert_eq!(initial.access_count, 0);
+
+        let _ = store.recall("alpha", 10);
+        let after_first = store.list(None)[0].clone();
+        assert_eq!(
+            after_first.access_count, 1,
+            "recall should bump access_count from 0 to 1"
+        );
+        assert_eq!(
+            after_first.id, id,
+            "access metadata should be bumped on the right memory"
+        );
+
+        // A second recall should bump it again, not stay at 1.
+        let _ = store.recall("alpha", 10);
+        let after_second = store.list(None)[0].clone();
+        assert_eq!(after_second.access_count, 2);
     }
 
     #[test]

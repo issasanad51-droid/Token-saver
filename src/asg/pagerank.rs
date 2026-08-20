@@ -175,10 +175,7 @@ pub fn pagerank<'a>(graph: &AsgGraph<'a>, config: &PageRankConfig) -> Vec<(NodeI
 }
 
 /// Same as [`pagerank`], but as a lookup map and stamped into the graph.
-pub fn pagerank_map<'a>(
-    graph: &AsgGraph<'a>,
-    config: &PageRankConfig,
-) -> HashMap<NodeId, f64> {
+pub fn pagerank_map<'a>(graph: &AsgGraph<'a>, config: &PageRankConfig) -> HashMap<NodeId, f64> {
     pagerank(graph, config).into_iter().collect()
 }
 
@@ -278,7 +275,13 @@ mod tests {
     use crate::asg::graph::NodeType;
     use std::borrow::Cow;
 
-    fn add_node<'a>(g: &mut AsgGraph<'a>, module: &[&str], kind: &str, name: &str, ty: NodeType) -> NodeId {
+    fn add_node<'a>(
+        g: &mut AsgGraph<'a>,
+        module: &[&str],
+        kind: &str,
+        name: &str,
+        ty: NodeType,
+    ) -> NodeId {
         let id = NodeId::qualified("crate", module, kind, name);
         g.add_node(id.clone(), ty, Cow::Borrowed("")).unwrap();
         id

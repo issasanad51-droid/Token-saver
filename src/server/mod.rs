@@ -12,8 +12,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::cors::AllowOrigin;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn};
 
 use crate::asg::{Asg, SharedAsg};
@@ -162,15 +162,17 @@ impl RateLimiter {
     pub async fn allow(&self, key: &str) -> bool {
         let mut buckets = self.buckets.lock().await;
         let now = std::time::Instant::now();
-        let bucket = buckets.entry(key.to_string()).or_insert_with(|| RateBucket {
-            tokens: self.max_tokens as f64,
-            last_refill: now,
-        });
+        let bucket = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| RateBucket {
+                tokens: self.max_tokens as f64,
+                last_refill: now,
+            });
 
         // Refill tokens based on elapsed time.
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec as f64)
-            .min(self.max_tokens as f64);
+        bucket.tokens =
+            (bucket.tokens + elapsed * self.refill_per_sec as f64).min(self.max_tokens as f64);
         bucket.last_refill = now;
 
         if bucket.tokens >= 1.0 {
@@ -288,9 +290,7 @@ pub struct RequestDebouncer {
 }
 
 impl RequestDebouncer {
-    pub fn new(
-        active_requests: Arc<tokio::sync::Mutex<HashMap<String, ActiveRequest>>>,
-    ) -> Self {
+    pub fn new(active_requests: Arc<tokio::sync::Mutex<HashMap<String, ActiveRequest>>>) -> Self {
         Self { active_requests }
     }
 
@@ -392,9 +392,7 @@ pub async fn autocomplete_handler(
     );
 
     let debouncer = RequestDebouncer::new(state.active_requests.clone());
-    let cancel_token = debouncer
-        .register(&request.file_path, generation)
-        .await;
+    let cancel_token = debouncer.register(&request.file_path, generation).await;
     let proceed = tokio::select! {
         _ = tokio::time::sleep(Duration::from_millis(state.debounce_ms)) => true,
         _ = cancel_token.cancelled() => false,
@@ -527,7 +525,9 @@ pub async fn search_handler(
         .filter_map(|r| state.asg.get_node(r.node_id))
         .map(|n| crate::tracker::estimate_tokens(&n.source))
         .sum();
-    state.total_tokens_served.fetch_add(tokens_served as u64, Ordering::Relaxed);
+    state
+        .total_tokens_served
+        .fetch_add(tokens_served as u64, Ordering::Relaxed);
 
     let hits = results
         .into_iter()
@@ -549,7 +549,8 @@ pub async fn search_handler(
     Json(SearchResponse {
         query: request.query,
         hits,
-    }).into_response()
+    })
+    .into_response()
 }
 
 pub async fn health_handler(State(state): State<ServerState>) -> impl IntoResponse {
@@ -576,7 +577,11 @@ pub async fn save_memory_handler(
     State(state): State<ServerState>,
     Json(request): Json<SaveMemoryRequest>,
 ) -> impl IntoResponse {
-    let id = state.memory_store.lock().await.save(&request.content, request.namespace, None);
+    let id = state
+        .memory_store
+        .lock()
+        .await
+        .save(&request.content, request.namespace, None);
     Json(SaveMemoryResponse { id })
 }
 
@@ -584,7 +589,11 @@ pub async fn recall_memory_handler(
     State(state): State<ServerState>,
     Json(request): Json<RecallMemoryRequest>,
 ) -> impl IntoResponse {
-    let memories = state.memory_store.lock().await.recall(&request.query, request.top_k);
+    let memories = state
+        .memory_store
+        .lock()
+        .await
+        .recall(&request.query, request.top_k);
     Json(RecallMemoryResponse { memories })
 }
 
@@ -600,7 +609,11 @@ pub async fn list_memory_handler(
     State(state): State<ServerState>,
     Query(query): Query<ListMemoryQuery>,
 ) -> impl IntoResponse {
-    let memories = state.memory_store.lock().await.list(query.namespace.as_deref());
+    let memories = state
+        .memory_store
+        .lock()
+        .await
+        .list(query.namespace.as_deref());
     Json(ListMemoryResponse { memories })
 }
 
@@ -629,15 +642,7 @@ pub async fn stats_handler(State(state): State<ServerState>) -> impl IntoRespons
 
     let mut edge_kinds: HashMap<String, usize> = HashMap::new();
     for edge in &state.asg.inner.edges {
-        let label = match edge.kind {
-            crate::asg::EdgeKind::Calls => "calls",
-            crate::asg::EdgeKind::Contains => "contains",
-            crate::asg::EdgeKind::Imports => "imports",
-            crate::asg::EdgeKind::References => "references",
-            crate::asg::EdgeKind::Implements => "implements",
-            crate::asg::EdgeKind::FieldOf => "field_of",
-            crate::asg::EdgeKind::VariantOf => "variant_of",
-        };
+        let label = crate::asg::edge_kind_label(edge.kind);
         *edge_kinds.entry(label.to_string()).or_default() += 1;
     }
 
@@ -762,14 +767,11 @@ pub async fn graph_node_handler(
                 .iter()
                 .filter_map(|&eid| {
                     let edge = &state.asg.inner.edges[eid];
-                    state
-                        .asg
-                        .get_node(edge.from)
-                        .map(|n| GraphEdge {
-                            node_id: n.id,
-                            node_name: n.name.clone(),
-                            kind: format!("{:?}", edge.kind),
-                        })
+                    state.asg.get_node(edge.from).map(|n| GraphEdge {
+                        node_id: n.id,
+                        node_name: n.name.clone(),
+                        kind: crate::asg::edge_kind_label(edge.kind).to_string(),
+                    })
                 })
                 .collect()
         })
@@ -785,14 +787,11 @@ pub async fn graph_node_handler(
                 .iter()
                 .filter_map(|&eid| {
                     let edge = &state.asg.inner.edges[eid];
-                    state
-                        .asg
-                        .get_node(edge.to)
-                        .map(|n| GraphEdge {
-                            node_id: n.id,
-                            node_name: n.name.clone(),
-                            kind: format!("{:?}", edge.kind),
-                        })
+                    state.asg.get_node(edge.to).map(|n| GraphEdge {
+                        node_id: n.id,
+                        node_name: n.name.clone(),
+                        kind: crate::asg::edge_kind_label(edge.kind).to_string(),
+                    })
                 })
                 .collect()
         })
@@ -822,9 +821,7 @@ pub struct ReindexResponse {
     pub message: String,
 }
 
-pub async fn reindex_handler(
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
+pub async fn reindex_handler(State(state): State<ServerState>) -> impl IntoResponse {
     let workspace = state.workspace.clone();
     let indexes = state.indexes.clone();
 
@@ -885,11 +882,12 @@ pub async fn update_memory_handler(
     Path(id): Path<String>,
     Json(request): Json<UpdateMemoryRequest>,
 ) -> impl IntoResponse {
-    let updated = state.memory_store.lock().await.update(
-        &id,
-        request.importance,
-        Some(request.namespace),
-    );
+    let updated =
+        state
+            .memory_store
+            .lock()
+            .await
+            .update(&id, request.importance, Some(request.namespace));
     Json(UpdateMemoryResponse { updated })
 }
 
@@ -967,7 +965,10 @@ pub fn build_router(state: ServerState, cors_origin: Option<&str>) -> Router {
         .route("/v1/graph/{node_id}", get(graph_node_handler))
         .route("/v1/reindex", post(reindex_handler))
         .route("/v1/metrics", get(metrics_handler))
-        .route("/v1/memories", post(save_memory_handler).get(list_memory_handler))
+        .route(
+            "/v1/memories",
+            post(save_memory_handler).get(list_memory_handler),
+        )
         .route("/v1/memories/recall", post(recall_memory_handler))
         .route("/v1/memories/{id}", delete(forget_memory_handler))
         .route("/v1/memories/{id}/update", post(update_memory_handler))
@@ -979,9 +980,9 @@ pub fn build_router(state: ServerState, cors_origin: Option<&str>) -> Router {
             AllowOrigin::any()
         } else {
             AllowOrigin::exact(
-                origin.parse().unwrap_or_else(|_| {
-                    axum::http::HeaderValue::from_bytes(b"*").unwrap()
-                })
+                origin
+                    .parse()
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_bytes(b"*").unwrap()),
             )
         };
         let cors = CorsLayer::new()
@@ -1022,7 +1023,11 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
     let asg = if let Some(ref store) = persistent_store {
         match store.load_asg() {
             Ok(Some(asg)) => {
-                info!("loaded ASG from persistent store: {} nodes, {} edges", asg.nodes.len(), asg.edges.len());
+                info!(
+                    "loaded ASG from persistent store: {} nodes, {} edges",
+                    asg.nodes.len(),
+                    asg.edges.len()
+                );
                 asg
             }
             Ok(None) => {
@@ -1037,7 +1042,11 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
     } else {
         build_asg(&workspace, &config)?
     };
-    info!("semantic ASG ready: {} nodes, {} edges", asg.nodes.len(), asg.edges.len());
+    info!(
+        "semantic ASG ready: {} nodes, {} edges",
+        asg.nodes.len(),
+        asg.edges.len()
+    );
 
     let mut compressor = crate::compressor::ChunkCompressor::new();
     let registry = compressor.compress_asg(&asg);
@@ -1046,14 +1055,15 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
         .iter()
         .map(|entry| entry.value().bytes_saved())
         .sum();
-    info!("compressed {} chunks ({} bytes saved)", registry.chunks.len(), saved_bytes);
+    info!(
+        "compressed {} chunks ({} bytes saved)",
+        registry.chunks.len(),
+        saved_bytes
+    );
 
     let shared_asg = SharedAsg::new(asg.clone());
-    let search_engine = SearchEngine::with_config(
-        shared_asg,
-        registry.clone(),
-        config.search.clone(),
-    );
+    let search_engine =
+        SearchEngine::with_config(shared_asg, registry.clone(), config.search.clone());
     search_engine.precompute_embeddings().await;
 
     let mut chunker = AstChunker::new()?.with_crate_root(&workspace);
@@ -1194,11 +1204,12 @@ pub async fn run_mcp_server_with_config(config: TokenSaverConfig) -> anyhow::Res
     let workspace = config.canonical_workspace()?;
     info!("indexing workspace {} for MCP server", workspace.display());
 
-    let asg = crate::asg::build_asg_from_dir_with_config(
-        &workspace,
-        config.search.ppr.clone(),
-    )?;
-    info!("semantic ASG ready: {} nodes, {} edges", asg.nodes.len(), asg.edges.len());
+    let asg = crate::asg::build_asg_from_dir_with_config(&workspace, config.search.ppr.clone())?;
+    info!(
+        "semantic ASG ready: {} nodes, {} edges",
+        asg.nodes.len(),
+        asg.edges.len()
+    );
 
     let mut compressor = crate::compressor::ChunkCompressor::new();
     let registry = compressor.compress_asg(&asg);
@@ -1213,5 +1224,5 @@ pub async fn run_mcp_server_with_config(config: TokenSaverConfig) -> anyhow::Res
 
     let memory_store = Arc::new(tokio::sync::Mutex::new(MemoryStore::new()));
 
-    crate::mcp::run_mcp_server(search_engine, shared_asg, memory_store).await
+    crate::mcp::run_mcp_server(search_engine, shared_asg, memory_store, workspace).await
 }

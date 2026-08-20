@@ -70,6 +70,26 @@ pub struct Edge {
     pub kind: EdgeKind,
 }
 
+/// Return the canonical snake_case wire label for an [`EdgeKind`].
+///
+/// This matches the `#[serde(rename_all = "snake_case")]` form used when
+/// `EdgeKind` is (de)serialized as JSON, so HTTP/MCP responses that emit
+/// edge kinds stay consistent with the serde contract. Previously the
+/// `graph_node_handler` used `format!("{:?}", edge.kind)` which produced
+/// `"Calls"` / `"Contains"` etc. — different from every other place edge
+/// kinds appear in the API.
+pub fn edge_kind_label(kind: EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::Calls => "calls",
+        EdgeKind::Contains => "contains",
+        EdgeKind::Imports => "imports",
+        EdgeKind::References => "references",
+        EdgeKind::Implements => "implements",
+        EdgeKind::FieldOf => "field_of",
+        EdgeKind::VariantOf => "variant_of",
+    }
+}
+
 /// The complete Abstract Semantic Graph.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Asg {
@@ -492,8 +512,7 @@ impl ChunkExtractor for Asg {
             .filter(|node| {
                 matches!(
                     node.kind.as_str(),
-                    "fn"
-                        | "struct"
+                    "fn" | "struct"
                         | "impl"
                         | "enum"
                         | "trait"

@@ -113,12 +113,7 @@ impl AstChunk {
     /// living in different scopes of one file — e.g. `impl A { fn new }` vs
     /// `impl B { fn new }` — which the Merkle/trigram/vector layers all rely on
     /// as their stable key.
-    pub fn make_id_ns(
-        file_path: &Path,
-        scope: &[String],
-        kind: ChunkKind,
-        name: &str,
-    ) -> String {
+    pub fn make_id_ns(file_path: &Path, scope: &[String], kind: ChunkKind, name: &str) -> String {
         let mut id = file_path.to_string_lossy().replace('\\', "/");
         for seg in scope {
             id.push_str("::");
@@ -187,15 +182,17 @@ impl AstChunker {
     /// Chunk every `.rs` file under `dir`.
     pub fn chunk_dir(&mut self, dir: &Path) -> anyhow::Result<Vec<AstChunk>> {
         let mut chunks = Vec::new();
-        let walker = walkdir::WalkDir::new(dir).into_iter().filter_entry(|entry| {
-            if !entry.file_type().is_dir() {
-                return true;
-            }
-            !matches!(
-                entry.file_name().to_string_lossy().as_ref(),
-                ".git" | "target" | "node_modules" | ".cache" | ".idea" | ".vscode"
-            )
-        });
+        let walker = walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_entry(|entry| {
+                if !entry.file_type().is_dir() {
+                    return true;
+                }
+                !matches!(
+                    entry.file_name().to_string_lossy().as_ref(),
+                    ".git" | "target" | "node_modules" | ".cache" | ".idea" | ".vscode"
+                )
+            });
         for entry in walker.filter_map(Result::ok) {
             let path = entry.path();
             if entry.file_type().is_file() && path.extension().map_or(false, |e| e == "rs") {
@@ -226,8 +223,8 @@ impl AstChunker {
         }
 
         if let Some(kind) = ChunkKind::from_ts_kind(node.kind()) {
-            let name = extract_name(node, source)
-                .unwrap_or_else(|| format!("<anon_{}>", node.kind()));
+            let name =
+                extract_name(node, source).unwrap_or_else(|| format!("<anon_{}>", node.kind()));
             let start = node.start_byte();
             let end = node.end_byte();
             let src = source.get(start..end).unwrap_or("").to_string();
@@ -332,7 +329,10 @@ impl Foo {
         // Every chunk's source is a complete, non-empty slice.
         for c in &chunks {
             assert!(!c.source.trim().is_empty());
-            assert_eq!(c.source, SAMPLE.get(c.byte_range.0..c.byte_range.1).unwrap());
+            assert_eq!(
+                c.source,
+                SAMPLE.get(c.byte_range.0..c.byte_range.1).unwrap()
+            );
         }
     }
 

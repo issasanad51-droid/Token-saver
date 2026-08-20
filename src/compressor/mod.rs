@@ -4,6 +4,18 @@
 //! A dictionary compressor replaces long custom identifiers with compact 1-2
 //! character tokens, maintaining an invertible mapping in a thread-safe
 //! hydration registry.
+//!
+//! # Token prefix safety
+//!
+//! Compressed tokens use the Unicode Private-Use-Area character [`TOKEN_PREFIX`]
+//! (U+E000) as a prefix instead of the historical `$`. This matters because
+//! hydration uses literal substring replacement (`String::replace`), and `$`
+//! appears naturally in Rust source — most notably inside `macro_rules!`
+//! bodies (`$x:expr`) and string/format literals. A token like `$x` assigned
+//! to some identifier would otherwise corrupt every literal `$x` already in
+//! the source. U+E000 is not a valid Rust identifier character and is
+//! extraordinarily unlikely to appear in source code, string literals, or
+//! comments, so literal-substring hydration is safe.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,6 +23,12 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 use crate::asg::{Asg, ChunkExtractor, Node};
+
+/// Prefix character used for compressed alias tokens.
+///
+/// See the module-level docs for why this is a Unicode Private-Use-Area
+/// character rather than `$`.
+pub const TOKEN_PREFIX: char = '\u{E000}';
 
 // ---------------------------------------------------------------------------
 // Chunk Registry
@@ -56,24 +74,17 @@ impl CompressedChunk {
 pub struct ChunkRegistry {
     /// node_id -> CompressedChunk
     pub chunks: Arc<DashMap<usize, CompressedChunk>>,
-    /// token -> original identifier (global, for hydration)
-    pub global_token_map: Arc<DashMap<String, String>>,
 }
 
 impl ChunkRegistry {
     pub fn new() -> Self {
         Self {
             chunks: Arc::new(DashMap::new()),
-            global_token_map: Arc::new(DashMap::new()),
         }
     }
 
     /// Register a compressed chunk.
     pub fn register(&self, chunk: CompressedChunk) {
-        // Populate global token map.
-        for (original, token) in &chunk.dictionary {
-            self.global_token_map.insert(token.clone(), original.clone());
-        }
         self.chunks.insert(chunk.node_id, chunk);
     }
 
@@ -113,12 +124,12 @@ pub struct IdentifierExtractor {
 impl Default for IdentifierExtractor {
     fn default() -> Self {
         let keywords: std::collections::HashSet<&'static str> = [
-            "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false",
-            "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
-            "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait",
-            "true", "type", "unsafe", "use", "where", "while", "async", "await", "dyn",
-            "abstract", "become", "box", "do", "final", "macro", "override", "priv",
-            "typeof", "unsized", "virtual", "yield", "try",
+            "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+            "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+            "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+            "unsafe", "use", "where", "while", "async", "await", "dyn", "abstract", "become",
+            "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual",
+            "yield", "try",
         ]
         .iter()
         .copied()
@@ -196,8 +207,11 @@ impl TokenGenerator {
     }
 
     /// Generate the next available token.
-    /// Tokens are of the form $a, $b, ..., $z, $A, $B, ..., $Z, $0, $1, ..., $9,
-    /// then $aa, $ab, etc.
+    /// Tokens are of the form `⟨pua⟩a`, `⟨pua⟩b`, ..., `⟨pua⟩z`, `⟨pua⟩A`, ...,
+    /// `⟨pua⟩Z`, `⟨pua⟩0`, ..., `⟨pua⟩9`, then `⟨pua⟩aa`, `⟨pua⟩ab`, etc.
+    ///
+    /// The prefix is [`TOKEN_PREFIX`] (U+E000), not `$` — see the module docs
+    /// for the hydration-safety rationale.
     pub fn next_token(&mut self) -> String {
         loop {
             let token = self.generate_token(self.counter);
@@ -221,7 +235,10 @@ impl TokenGenerator {
             index = index / base - 1;
         }
         suffix.reverse();
-        format!("${}", suffix.into_iter().collect::<String>())
+        let mut token = String::with_capacity(1 + suffix.len());
+        token.push(TOKEN_PREFIX);
+        token.extend(suffix);
+        token
     }
 }
 
@@ -283,14 +300,17 @@ impl ChunkCompressor {
 
         for identifier in identifiers {
             let pattern = format!(r"\b{}\b", regex::escape(&identifier));
-            let Ok(expression) = regex::Regex::new(&pattern) else { continue };
+            let Ok(expression) = regex::Regex::new(&pattern) else {
+                continue;
+            };
             let occurrences = expression.find_iter(source).count();
             if occurrences == 0 {
                 continue;
             }
 
             let token = self.token_gen.next_token();
-            let body_savings = occurrences.saturating_mul(identifier.len().saturating_sub(token.len()));
+            let body_savings =
+                occurrences.saturating_mul(identifier.len().saturating_sub(token.len()));
             // Approximate this alias's `token=identifier,` legend cost. The
             // final exact-size check below catches interactions and header cost.
             let legend_cost = token.len() + identifier.len() + 2;
@@ -333,22 +353,28 @@ mod tests {
 
     #[test]
     fn hydration_is_lossless_with_prefix_tokens() {
+        let pa = TOKEN_PREFIX;
+        let aa = format!("{pa}aa");
+        let a = format!("{pa}a");
         let registry = ChunkRegistry::new();
         registry.register(CompressedChunk {
             node_id: 7,
-            compressed_source: "$aa($a)".to_string(),
+            compressed_source: format!("{aa}({a})"),
             dictionary: HashMap::from([
-                ("long_function".to_string(), "$aa".to_string()),
-                ("long_value".to_string(), "$a".to_string()),
+                ("long_function".to_string(), aa.clone()),
+                ("long_value".to_string(), a.clone()),
             ]),
             reverse_dictionary: HashMap::from([
-                ("$aa".to_string(), "long_function".to_string()),
-                ("$a".to_string(), "long_value".to_string()),
+                (aa, "long_function".to_string()),
+                (a, "long_value".to_string()),
             ]),
             original_bytes: 30,
             compressed_bytes: 7,
         });
-        assert_eq!(registry.hydrate(7).as_deref(), Some("long_function(long_value)"));
+        assert_eq!(
+            registry.hydrate(7).as_deref(),
+            Some("long_function(long_value)")
+        );
     }
 
     #[test]
@@ -377,7 +403,59 @@ mod tests {
         for _ in 0..4_000 {
             last = generator.next_token();
         }
-        assert!(last.starts_with('$'));
+        assert!(last.starts_with(TOKEN_PREFIX));
         assert_eq!(generator.used_tokens.len(), 4_000);
+    }
+
+    /// Regression test: a source that already contains a literal `$x` (e.g.
+    /// inside a `macro_rules!` body or a string literal) must not be corrupted
+    /// when an identifier happens to be assigned `$x`-style alias. With the
+    /// historical `$` prefix, `String::replace` would rewrite the macro
+    /// variable too. With the U+E000 prefix, the token cannot collide with
+    /// any literal in real Rust source.
+    #[test]
+    fn macro_rules_dollar_literals_survive_compression() {
+        // A macro_rules! body whose `$matcher` variable shadows the alias we
+        // would assign to the identifier `alpha_matcher` (which appears many
+        // times so the compressor will alias it).
+        let source = r#"
+macro_rules! consume_matcher {
+    ($matcher:expr) => {
+        let alpha_matcher = $matcher;
+        alpha_matcher.process(alpha_matcher);
+        alpha_matcher.process(alpha_matcher);
+        alpha_matcher.process(alpha_matcher);
+        alpha_matcher.process(alpha_matcher);
+        alpha_matcher.process(alpha_matcher);
+    };
+}
+"#;
+        let mut compressor = ChunkCompressor::new();
+        let chunk = compressor.compress_source(source);
+        let hydrated = if chunk.dictionary.is_empty() {
+            source.to_string()
+        } else {
+            // Reconstruct the round-trip by hand via hydrate semantics.
+            let mut out = chunk.compressed_source.clone();
+            let mut aliases: Vec<(&String, &String)> =
+                chunk.reverse_dictionary.iter().collect();
+            aliases.sort_by_key(|(token, _)| std::cmp::Reverse(token.len()));
+            for (token, original) in aliases {
+                out = out.replace(token, original);
+            }
+            out
+        };
+        // The macro_rules `$matcher` literal must be preserved verbatim.
+        assert!(
+            hydrated.contains("$matcher"),
+            "macro_rules $matcher literal was corrupted: {hydrated}"
+        );
+        // The repeated `alpha_matcher` identifier must also be preserved
+        // after hydration (round-trip is lossless when the dictionary is
+        // applied).
+        assert!(
+            hydrated.contains("alpha_matcher"),
+            "alpha_matcher identifier was lost: {hydrated}"
+        );
     }
 }

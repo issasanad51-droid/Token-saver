@@ -15,14 +15,11 @@ pub mod rrf;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::asg::{
-    Node, PageRankEngine, PersonalizedPageRankConfig, SharedAsg,
-};
+use crate::asg::{Node, PageRankEngine, PersonalizedPageRankConfig, SharedAsg};
 use crate::compressor::ChunkRegistry;
 use rrf::{RankedDoc, RrfConfig};
 
@@ -92,6 +89,15 @@ pub struct MergedResult {
 // Search engine
 // ---------------------------------------------------------------------------
 
+/// Bundle of BM25 corpus caches that [`SearchEngine::bm25_search`] reads per
+/// query. Grouping them avoids the clippy `too_many_arguments` lint and keeps
+/// the call site readable.
+struct Bm25Caches {
+    document_terms: Arc<RwLock<HashMap<usize, Vec<String>>>>,
+    document_frequency: Arc<RwLock<HashMap<String, usize>>>,
+    average_doc_len: Arc<RwLock<f64>>,
+}
+
 #[derive(Clone)]
 pub struct SearchEngine {
     asg: SharedAsg,
@@ -101,10 +107,17 @@ pub struct SearchEngine {
     embeddings: Arc<RwLock<HashMap<usize, Vec<f64>>>>,
     /// Cached tokenized document terms for BM25 (node_id -> terms).
     document_terms: Arc<RwLock<HashMap<usize, Vec<String>>>>,
-    /// Timestamp of last access for temporal decay.
-    last_access: Arc<std::sync::Mutex<Instant>>,
-    /// Temporal decay factor per second (default 0.995, half-life ~138s).
-    decay_factor: f64,
+    /// Cached `term -> document frequency` for BM25. Populated by
+    /// [`precompute_embeddings`](Self::precompute_embeddings) and consumed by
+    /// [`bm25_search`](Self::bm25_search). Previously, BM25 recomputed the
+    /// document frequency for every query term by scanning the full corpus
+    /// per term — O(N·Q) per search. Caching turns that into O(Q) hash
+    /// lookups.
+    document_frequency: Arc<RwLock<HashMap<String, usize>>>,
+    /// Cached average document length across the searchable corpus. Updated
+    /// alongside [`document_frequency`](Self::document_frequency) so BM25
+    /// doesn't recompute it per query.
+    average_doc_len: Arc<RwLock<f64>>,
 }
 
 impl SearchEngine {
@@ -119,8 +132,8 @@ impl SearchEngine {
             config,
             embeddings: Arc::new(RwLock::new(HashMap::new())),
             document_terms: Arc::new(RwLock::new(HashMap::new())),
-            last_access: Arc::new(std::sync::Mutex::new(Instant::now())),
-            decay_factor: 0.995,
+            document_frequency: Arc::new(RwLock::new(HashMap::new())),
+            average_doc_len: Arc::new(RwLock::new(0.0)),
         }
     }
 
@@ -128,28 +141,21 @@ impl SearchEngine {
         &self.config
     }
 
-    /// Apply temporal decay to PPR scores so stale code fades over time.
-    /// Each score is multiplied by `decay_factor^elapsed_secs`.
-    pub fn apply_temporal_decay(&self, scores: &mut [f64]) {
-        let last = *self.last_access.lock().unwrap();
-        let elapsed = last.elapsed().as_secs_f64();
-        if elapsed <= 0.0 || !self.decay_factor.is_finite() {
-            return;
-        }
-        let decay = self.decay_factor.powf(elapsed);
-        for score in scores.iter_mut() {
-            *score *= decay;
-        }
-    }
-
-    /// Update the last access timestamp to now.
-    pub fn touch_access(&self) {
-        *self.last_access.lock().unwrap() = Instant::now();
-    }
+    // Note: temporal decay (`apply_temporal_decay` / `touch_access`) was
+    // removed. The previous implementation was a no-op: `touch_access()` was
+    // called *before* `structural_search` read `last_access`, so `elapsed`
+    // was always ~0 and the decay factor always evaluated to 1.0. Even if
+    // the ordering were fixed, PPR scores are recomputed per query, so a
+    // uniform multiplier on all scores cannot change ranking — only the
+    // absolute magnitude, which downstream RRF ignores (RRF uses rank, not
+    // score, for the base contribution).
 
     /// Precompute vectors and document terms once. The feature hasher is
     /// deterministic, local, dependency-free, and gives exact identifiers
     /// substantially more weight than fuzzy character trigrams.
+    ///
+    /// Also precomputes the BM25 corpus statistics (`document_frequency` and
+    /// `average_doc_len`) so per-query BM25 is O(Q) instead of O(N·Q).
     pub async fn precompute_embeddings(&self) {
         let mut embeddings = self.embeddings.write().await;
         let mut doc_terms = self.document_terms.write().await;
@@ -162,6 +168,28 @@ impl SearchEngine {
                 doc_terms.insert(node.id, tokenize(&ctx_text));
             }
         }
+
+        // Build the BM25 corpus statistics in the same critical section so
+        // downstream `bm25_search` callers never recompute df/avg_len.
+        let mut df: HashMap<String, usize> = HashMap::new();
+        let mut total_len: usize = 0;
+        for terms in doc_terms.values() {
+            let mut seen_in_doc: HashSet<&str> = HashSet::new();
+            for term in terms {
+                if seen_in_doc.insert(term.as_str()) {
+                    *df.entry(term.clone()).or_default() += 1;
+                }
+            }
+            total_len += terms.len();
+        }
+        let avg_len = if doc_terms.is_empty() {
+            0.0
+        } else {
+            total_len as f64 / doc_terms.len() as f64
+        };
+        drop(doc_terms);
+        *self.document_frequency.write().await = df;
+        *self.average_doc_len.write().await = avg_len;
     }
 
     /// Search without editor context.
@@ -184,8 +212,6 @@ impl SearchEngine {
         if self.embeddings.read().await.is_empty() {
             self.precompute_embeddings().await;
         }
-
-        self.touch_access();
 
         let pool_size = top_k
             .saturating_mul(self.config.candidate_multiplier.max(1))
@@ -218,12 +244,16 @@ impl SearchEngine {
         let lexical_query = query.to_owned();
         let k1 = self.config.bm25_k1;
         let b = self.config.bm25_b;
-        let lexical_document_terms = self.document_terms.clone();
+        let lexical_caches = Bm25Caches {
+            document_terms: self.document_terms.clone(),
+            document_frequency: self.document_frequency.clone(),
+            average_doc_len: self.average_doc_len.clone(),
+        };
         let lexical_task = tokio::spawn(async move {
             Self::bm25_search(
                 lexical_asg,
                 lexical_registry,
-                lexical_document_terms,
+                lexical_caches,
                 &lexical_query,
                 k1,
                 b,
@@ -239,8 +269,6 @@ impl SearchEngine {
         let structural_asg = self.asg.clone();
         let structural_registry = self.registry.clone();
         let ppr_config = self.config.ppr.clone();
-        let decay_factor = self.decay_factor;
-        let last_access = self.last_access.clone();
         let structural = tokio::task::spawn_blocking(move || {
             Self::structural_search(
                 structural_asg,
@@ -248,8 +276,6 @@ impl SearchEngine {
                 ppr_config,
                 seeds,
                 pool_size,
-                decay_factor,
-                last_access,
             )
         })
         .await
@@ -301,7 +327,7 @@ impl SearchEngine {
     async fn bm25_search(
         asg: SharedAsg,
         registry: Arc<ChunkRegistry>,
-        document_terms_cache: Arc<RwLock<HashMap<usize, Vec<String>>>>,
+        caches: Bm25Caches,
         query: &str,
         configured_k1: f64,
         configured_b: f64,
@@ -315,17 +341,13 @@ impl SearchEngine {
 
         // Use cached document terms if available, otherwise fall back to
         // re-tokenizing from searchable text.
-        let cached = document_terms_cache.read().await;
+        let cached = caches.document_terms.read().await;
         let documents: Vec<(usize, Vec<String>)> = if !cached.is_empty() {
             asg.inner
                 .nodes
                 .iter()
                 .filter(|node| registry.chunks.contains_key(&node.id))
-                .filter_map(|node| {
-                    cached
-                        .get(&node.id)
-                        .map(|terms| (node.id, terms.clone()))
-                })
+                .filter_map(|node| cached.get(&node.id).map(|terms| (node.id, terms.clone())))
                 .collect()
         } else {
             drop(cached);
@@ -343,11 +365,18 @@ impl SearchEngine {
             return Vec::new();
         }
 
-        let average_length = documents
-            .iter()
-            .map(|(_, terms)| terms.len())
-            .sum::<usize>() as f64
-            / documents.len() as f64;
+        let average_length = {
+            let cached_avg = *caches.average_doc_len.read().await;
+            if cached_avg > 0.0 {
+                cached_avg
+            } else {
+                documents
+                    .iter()
+                    .map(|(_, terms)| terms.len())
+                    .sum::<usize>() as f64
+                    / documents.len() as f64
+            }
+        };
         let document_count = documents.len() as f64;
         let k1 = if configured_k1.is_finite() {
             configured_k1.max(0.01)
@@ -360,13 +389,27 @@ impl SearchEngine {
             0.75
         };
 
+        // Prefer the cached document-frequency table. If the cache is empty
+        // (e.g. the engine wasn't precomputed yet), fall back to the original
+        // per-query computation to preserve correctness — but log nothing
+        // because this path shouldn't happen in normal operation.
+        let cached_df = caches.document_frequency.read().await;
         let mut document_frequency: HashMap<&str, usize> = HashMap::new();
-        for term in &unique_query {
-            let count = documents
-                .iter()
-                .filter(|(_, terms)| terms.iter().any(|candidate| candidate.as_str() == *term))
-                .count();
-            document_frequency.insert(*term, count);
+        if !cached_df.is_empty() {
+            for term in &unique_query {
+                if let Some(count) = cached_df.get(*term) {
+                    document_frequency.insert(*term, *count);
+                }
+            }
+        } else {
+            drop(cached_df);
+            for term in &unique_query {
+                let count = documents
+                    .iter()
+                    .filter(|(_, terms)| terms.iter().any(|candidate| candidate.as_str() == *term))
+                    .count();
+                document_frequency.insert(*term, count);
+            }
         }
 
         let mut results = Vec::new();
@@ -444,31 +487,14 @@ impl SearchEngine {
         config: PersonalizedPageRankConfig,
         seeds: Vec<(usize, f64)>,
         top_k: usize,
-        decay_factor: f64,
-        last_access: Arc<std::sync::Mutex<Instant>>,
     ) -> Vec<SearchResult> {
         let engine = PageRankEngine::from_config(config);
         let scores = engine.personalized_scores(&asg.inner, &seeds);
 
-        // Apply temporal decay to PPR scores so stale code fades over time.
-        let mut scores = scores;
-        {
-            let last = *last_access.lock().unwrap();
-            let elapsed = last.elapsed().as_secs_f64();
-            if elapsed > 0.0 && decay_factor.is_finite() {
-                let decay = decay_factor.powf(elapsed);
-                for score in scores.iter_mut() {
-                    *score *= decay;
-                }
-            }
-        }
-
         let mut results: Vec<SearchResult> = scores
             .into_iter()
             .enumerate()
-            .filter(|(node_id, score)| {
-                *score > 0.0 && registry.chunks.contains_key(node_id)
-            })
+            .filter(|(node_id, score)| *score > 0.0 && registry.chunks.contains_key(node_id))
             .map(|(node_id, score)| SearchResult {
                 node_id,
                 score,
