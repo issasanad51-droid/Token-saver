@@ -108,13 +108,12 @@ impl<'a> AsgBuilder<'a> {
 
     /// Parse a single file (already present in the source set).
     pub fn parse_file(&mut self, path: &Path) -> Result<(), AsgError> {
-        let source: &'a str = self
-            .source_set
-            .get(path)
-            .ok_or_else(|| AsgError::Io(std::io::Error::new(
+        let source: &'a str = self.source_set.get(path).ok_or_else(|| {
+            AsgError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("{} not in SourceSet", path.display()),
-            )))?;
+            ))
+        })?;
 
         let tree = self
             .parser
@@ -192,13 +191,39 @@ impl<'a> AsgBuilder<'a> {
     ) {
         match node.kind() {
             "function_item" => self.add_fn(node, source, path, module, parent),
-            "struct_item" => self.add_typed(node, source, path, module, parent, NodeType::Struct, "struct"),
-            "enum_item" => self.add_typed(node, source, path, module, parent, NodeType::Enum, "enum"),
-            "trait_item" => self.add_typed(node, source, path, module, parent, NodeType::Trait, "trait"),
-            "type_item" => self.add_typed(node, source, path, module, parent, NodeType::Type, "type"),
-            "const_item" => self.add_typed(node, source, path, module, parent, NodeType::Const, "const"),
-            "static_item" => self.add_typed(node, source, path, module, parent, NodeType::Static, "static"),
-            "macro_definition" => self.add_typed(node, source, path, module, parent, NodeType::Macro, "macro"),
+            "struct_item" => self.add_typed(
+                node,
+                source,
+                path,
+                module,
+                parent,
+                NodeType::Struct,
+                "struct",
+            ),
+            "enum_item" => {
+                self.add_typed(node, source, path, module, parent, NodeType::Enum, "enum")
+            }
+            "trait_item" => {
+                self.add_typed(node, source, path, module, parent, NodeType::Trait, "trait")
+            }
+            "type_item" => {
+                self.add_typed(node, source, path, module, parent, NodeType::Type, "type")
+            }
+            "const_item" => {
+                self.add_typed(node, source, path, module, parent, NodeType::Const, "const")
+            }
+            "static_item" => self.add_typed(
+                node,
+                source,
+                path,
+                module,
+                parent,
+                NodeType::Static,
+                "static",
+            ),
+            "macro_definition" => {
+                self.add_typed(node, source, path, module, parent, NodeType::Macro, "macro")
+            }
             "impl_item" => self.add_impl(node, source, path, module, parent),
             "mod_item" => self.add_mod(node, source, path, module, parent),
             _ => {}
@@ -213,7 +238,9 @@ impl<'a> AsgBuilder<'a> {
         module: &[String],
         parent: Option<NodeId>,
     ) {
-        let Some(name) = field_text(node, "name", source) else { return };
+        let Some(name) = field_text(node, "name", source) else {
+            return;
+        };
         let id = self.scoped_id(module, parent.as_ref(), "fn", &name);
         self.insert_node(node, source, path, module, parent, id, NodeType::Fn);
     }
@@ -228,7 +255,9 @@ impl<'a> AsgBuilder<'a> {
         node_type: NodeType,
         kind_label: &str,
     ) {
-        let Some(name) = field_text(node, "name", source) else { return };
+        let Some(name) = field_text(node, "name", source) else {
+            return;
+        };
         let id = self.scoped_id(module, parent.as_ref(), kind_label, &name);
         self.insert_node(node, source, path, module, parent, id, node_type);
     }
@@ -253,7 +282,15 @@ impl<'a> AsgBuilder<'a> {
         let base_id = self.scoped_id(module, parent.as_ref(), "impl", &label);
         let id = self.unique_id(base_id);
 
-        self.insert_node(node, source, path, module, parent, id.clone(), NodeType::Impl);
+        self.insert_node(
+            node,
+            source,
+            path,
+            module,
+            parent,
+            id.clone(),
+            NodeType::Impl,
+        );
 
         if let Some(t) = trait_name {
             self.pending_impls.push(PendingImpl {
@@ -276,15 +313,27 @@ impl<'a> AsgBuilder<'a> {
         module: &[String],
         parent: Option<NodeId>,
     ) {
-        let Some(name) = field_text(node, "name", source) else { return };
+        let Some(name) = field_text(node, "name", source) else {
+            return;
+        };
 
         // Bare `mod foo;` file declarations are resolved through the module
         // path, not as graph entities — only inline `mod { .. }` bodies become
         // nodes, keeping the graph sparse and structural.
-        let Some(body) = node.child_by_field_name("body") else { return };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
 
         let id = self.scoped_id(module, parent.as_ref(), "mod", &name);
-        self.insert_node(node, source, path, module, parent, id.clone(), NodeType::Mod);
+        self.insert_node(
+            node,
+            source,
+            path,
+            module,
+            parent,
+            id.clone(),
+            NodeType::Mod,
+        );
 
         // Inline module: recurse with an extended module path.
         let mut child_module = module.to_vec();
@@ -360,21 +409,20 @@ impl<'a> AsgBuilder<'a> {
     }
 
     fn register_symbol(&mut self, id: &NodeId, module: &[String], parent: Option<&NodeId>) {
-        let name = id
-            .0
-            .rsplit("::")
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let name = id.0.rsplit("::").next().unwrap_or("").to_string();
 
         // Keep the first bare-name binding. A bare method such as `new` is
         // inherently ambiguous; replacing it on every file made resolution
         // depend on traversal order.
-        self.symbols.entry(name.clone()).or_insert_with(|| id.clone());
+        self.symbols
+            .entry(name.clone())
+            .or_insert_with(|| id.clone());
 
         let mut parts = module.to_vec();
         parts.push(name.clone());
-        self.symbols.entry(parts.join("::")).or_insert_with(|| id.clone());
+        self.symbols
+            .entry(parts.join("::"))
+            .or_insert_with(|| id.clone());
 
         // Methods also get a `Type::method` alias derived from their impl owner,
         // allowing `AppState::new()` to resolve without a compiler type pass.
@@ -420,13 +468,7 @@ impl<'a> AsgBuilder<'a> {
         }
     }
 
-    fn scan_subtree(
-        &mut self,
-        node: TsNode,
-        source: &'a str,
-        owner: NodeId,
-        module: &[String],
-    ) {
+    fn scan_subtree(&mut self, node: TsNode, source: &'a str, owner: NodeId, module: &[String]) {
         match node.kind() {
             "call_expression" => {
                 if let Some(callee) = node.child_by_field_name("function") {
@@ -482,7 +524,9 @@ impl<'a> AsgBuilder<'a> {
         for pi in std::mem::take(&mut self.pending_impls) {
             if let Some(target) = self.resolve_name(&pi.trait_name, &pi.module) {
                 if target != pi.impl_id {
-                    let _ = self.graph.add_edge(&pi.impl_id, &target, EdgeKind::Implements);
+                    let _ = self
+                        .graph
+                        .add_edge(&pi.impl_id, &target, EdgeKind::Implements);
                 }
             }
         }
@@ -666,7 +710,15 @@ impl AppState {
         let new_id = NodeId::new(format!("{}::fn::new", impl_id.as_str()));
 
         // Entities exist with the expected global tracker ids.
-        for id in [&main_id, &run_id, &app_state_id, &db_id, &new_id, &serve_id, &impl_id] {
+        for id in [
+            &main_id,
+            &run_id,
+            &app_state_id,
+            &db_id,
+            &new_id,
+            &serve_id,
+            &impl_id,
+        ] {
             assert!(g.contains(id), "missing node {id}");
         }
 

@@ -1,7 +1,12 @@
 //! Persistent storage using redb (ACID key-value store).
 //!
-//! Saves and loads the ASG, embeddings, and chunk registry so the server
-//! doesn't need a full rebuild on every restart.
+//! Saves and loads the ASG, embeddings, and memories so the server doesn't
+//! need a full rebuild on every restart.
+//!
+//! Note: the [`ChunkRegistry`](crate::compressor::ChunkRegistry) is intentionally
+//! not persisted — compressed chunks are cheap to recompute from the ASG on
+//! startup (a single pass over functional nodes), and persisting them would
+//! introduce a stale-cache hazard if the alias-token format ever changes.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,8 +20,6 @@ const DATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("data");
 
 const ASG_KEY: &str = "asg";
 const EMBEDDINGS_KEY: &str = "embeddings";
-#[allow(dead_code)]
-const CHUNKS_KEY: &str = "chunks";
 const MEMORIES_KEY: &str = "memories";
 
 /// Persistent store backed by redb.
@@ -58,8 +61,7 @@ impl PersistentStore {
 
     /// Save the ASG.
     pub fn save_asg(&self, asg: &crate::asg::Asg) -> anyhow::Result<()> {
-        let data =
-            serde_json::to_vec(asg).with_context(|| "failed to serialize ASG")?;
+        let data = serde_json::to_vec(asg).with_context(|| "failed to serialize ASG")?;
         self.save(ASG_KEY, &data)
     }
 
@@ -67,20 +69,16 @@ impl PersistentStore {
     pub fn load_asg(&self) -> anyhow::Result<Option<crate::asg::Asg>> {
         match self.load(ASG_KEY)? {
             Some(data) => Ok(Some(
-                serde_json::from_slice(&data)
-                    .with_context(|| "failed to deserialize ASG")?,
+                serde_json::from_slice(&data).with_context(|| "failed to deserialize ASG")?,
             )),
             None => Ok(None),
         }
     }
 
     /// Save embeddings.
-    pub fn save_embeddings(
-        &self,
-        embeddings: &HashMap<usize, Vec<f64>>,
-    ) -> anyhow::Result<()> {
-        let data = serde_json::to_vec(embeddings)
-            .with_context(|| "failed to serialize embeddings")?;
+    pub fn save_embeddings(&self, embeddings: &HashMap<usize, Vec<f64>>) -> anyhow::Result<()> {
+        let data =
+            serde_json::to_vec(embeddings).with_context(|| "failed to serialize embeddings")?;
         self.save(EMBEDDINGS_KEY, &data)
     }
 
@@ -98,8 +96,8 @@ impl PersistentStore {
     /// Save all memories.
     pub fn save_memories(&self, memories: &crate::memory::MemoryStore) -> anyhow::Result<()> {
         let all_memories = memories.list(None);
-        let data = serde_json::to_vec(&all_memories)
-            .with_context(|| "failed to serialize memories")?;
+        let data =
+            serde_json::to_vec(&all_memories).with_context(|| "failed to serialize memories")?;
         self.save(MEMORIES_KEY, &data)
     }
 

@@ -11,6 +11,7 @@
 //! - `update_memory`: Update an existing memory's importance or namespace
 
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ use serde_json::Value;
 use crate::asg::SharedAsg;
 use crate::memory::MemoryStore;
 use crate::search::SearchEngine;
+use crate::tracker::CursorPayload;
 
 // MCP JSON-RPC types
 #[derive(Debug, Deserialize)]
@@ -52,10 +54,16 @@ struct ToolInfo {
 }
 
 /// Run the MCP server on stdin/stdout.
+///
+/// `workspace_root` is the canonicalized workspace path used to resolve
+/// `get_context` `file_path` arguments safely (paths must stay inside the
+/// workspace) and to translate `line`/`column` cursor positions into UTF-8
+/// byte offsets against the file's source.
 pub async fn run_mcp_server(
     search_engine: Arc<SearchEngine>,
     asg: SharedAsg,
     memory_store: Arc<tokio::sync::Mutex<MemoryStore>>,
+    workspace_root: PathBuf,
 ) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -85,8 +93,14 @@ pub async fn run_mcp_server(
         };
 
         let id = request.id.clone().unwrap_or(Value::Null);
-        let (result, error) =
-            handle_request(request, &search_engine, &asg, &memory_store).await;
+        let (result, error) = handle_request(
+            request,
+            &search_engine,
+            &asg,
+            &memory_store,
+            &workspace_root,
+        )
+        .await;
 
         let resp = JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
@@ -106,6 +120,7 @@ async fn handle_request(
     search_engine: &SearchEngine,
     asg: &SharedAsg,
     memory_store: &Arc<tokio::sync::Mutex<MemoryStore>>,
+    workspace_root: &std::path::Path,
 ) -> (Option<Value>, Option<JsonRpcError>) {
     match req.method.as_str() {
         "initialize" => {
@@ -125,7 +140,8 @@ async fn handle_request(
             let tools = vec![
                 ToolInfo {
                     name: "search_code".to_string(),
-                    description: "Search the codebase using hybrid BM25 + PPR + semantic retrieval".to_string(),
+                    description: "Search the codebase using hybrid BM25 + PPR + semantic retrieval"
+                        .to_string(),
                     input_schema: serde_json::json!({
                         "type": "object",
                         "properties": {
@@ -137,7 +153,8 @@ async fn handle_request(
                 },
                 ToolInfo {
                     name: "save_memory".to_string(),
-                    description: "Store a fact, design decision, or pattern for later recall".to_string(),
+                    description: "Store a fact, design decision, or pattern for later recall"
+                        .to_string(),
                     input_schema: serde_json::json!({
                         "type": "object",
                         "properties": {
@@ -218,25 +235,13 @@ async fn handle_request(
         }
         "tools/call" => {
             let params = req.params.unwrap_or(Value::Null);
-            let tool_name = params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or(Value::Null);
+            let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
             match tool_name {
                 "search_code" => {
-                    let query = args
-                        .get("query")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let top_k = args
-                        .get("top_k")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(10) as usize;
+                    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
                     let results = search_engine.search(query, top_k).await;
                     let hits: Vec<serde_json::Value> = results
                         .iter()
@@ -260,18 +265,16 @@ async fn handle_request(
                     )
                 }
                 "save_memory" => {
-                    let content = args
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     let namespace = args
                         .get("namespace")
                         .and_then(|v| v.as_str())
                         .map(String::from);
-                    let importance = args
-                        .get("importance")
-                        .and_then(|v| v.as_f64());
-                    let id = memory_store.lock().await.save(content, namespace, importance);
+                    let importance = args.get("importance").and_then(|v| v.as_f64());
+                    let id = memory_store
+                        .lock()
+                        .await
+                        .save(content, namespace, importance);
                     (
                         Some(serde_json::json!({
                             "content": [{ "type": "text", "text": format!("Memory saved: {}", id) }]
@@ -280,14 +283,8 @@ async fn handle_request(
                     )
                 }
                 "recall" => {
-                    let query = args
-                        .get("query")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let top_k = args
-                        .get("top_k")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(10) as usize;
+                    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
                     let memories = memory_store.lock().await.recall(query, top_k);
                     (
                         Some(serde_json::json!({
@@ -297,10 +294,7 @@ async fn handle_request(
                     )
                 }
                 "forget_memory" => {
-                    let id = args
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let forgotten = memory_store.lock().await.forget(id);
                     (
                         Some(serde_json::json!({
@@ -327,7 +321,8 @@ async fn handle_request(
                     )
                 }
                 "list_files" => {
-                    let files: Vec<serde_json::Value> = asg.inner
+                    let files: Vec<serde_json::Value> = asg
+                        .inner
                         .file_index
                         .iter()
                         .map(|(path, node_ids)| {
@@ -345,36 +340,40 @@ async fn handle_request(
                     )
                 }
                 "get_context" => {
-                    let file_path = args
-                        .get("file_path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let line = args
-                        .get("line")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as usize;
-                    let column = args
-                        .get("column")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as usize;
+                    let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+                    let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let column = args.get("column").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
-                    // Find the node at the cursor position.
-                    let node_info = asg.inner
-                        .file_index
-                        .get(std::path::Path::new(file_path))
-                        .and_then(|node_ids| {
-                            node_ids.iter().find_map(|&id| {
-                                asg.get_node(id).map(|node| {
-                                    serde_json::json!({
-                                        "name": node.name,
-                                        "kind": node.kind,
-                                        "tracker_id": node.tracker_id,
-                                        "pagerank": node.pagerank,
-                                        "range": [node.range.0, node.range.1]
-                                    })
+                    // Resolve the requested path against the workspace and
+                    // reject anything that escapes it (same containment
+                    // contract as the HTTP `context_handler`).
+                    let resolved = resolve_workspace_path(workspace_root, file_path);
+                    let node_info = resolved.and_then(|path| {
+                        let source = std::fs::read_to_string(&path).ok()?;
+                        let byte_offset =
+                            CursorPayload::new(file_path, line, column).to_byte_offset(&source);
+                        let node_ids = asg.inner.file_index.get(&path)?;
+                        // Pick the *smallest* node whose byte range contains
+                        // the cursor — the previous implementation returned the
+                        // first node in the file regardless of cursor
+                        // position, which made `line` and `column` no-ops.
+                        node_ids
+                            .iter()
+                            .filter_map(|id| asg.get_node(*id))
+                            .filter(|node| {
+                                byte_offset >= node.range.0 && byte_offset < node.range.1
+                            })
+                            .min_by_key(|node| node.range.1.saturating_sub(node.range.0))
+                            .map(|node| {
+                                serde_json::json!({
+                                    "name": node.name,
+                                    "kind": node.kind,
+                                    "tracker_id": node.tracker_id,
+                                    "pagerank": node.pagerank,
+                                    "range": [node.range.0, node.range.1]
                                 })
                             })
-                        });
+                    });
 
                     let result = serde_json::json!({
                         "file": file_path,
@@ -390,22 +389,16 @@ async fn handle_request(
                     )
                 }
                 "update_memory" => {
-                    let id = args
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let importance = args
-                        .get("importance")
-                        .and_then(|v| v.as_f64());
+                    let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let importance = args.get("importance").and_then(|v| v.as_f64());
                     let namespace = args
                         .get("namespace")
                         .and_then(|v| v.as_str())
                         .map(String::from);
-                    let updated = memory_store.lock().await.update(
-                        id,
-                        importance,
-                        Some(namespace),
-                    );
+                    let updated = memory_store
+                        .lock()
+                        .await
+                        .update(id, importance, Some(namespace));
                     (
                         Some(serde_json::json!({
                             "content": [{ "type": "text", "text": if updated { "Memory updated" } else { "Memory not found" } }]
@@ -429,5 +422,68 @@ async fn handle_request(
                 message: format!("Method not found: {}", req.method),
             }),
         ),
+    }
+}
+
+/// Resolve a `file_path` argument against the workspace root and enforce
+/// path containment. Returns the canonicalized absolute path only when it
+/// lives inside `workspace_root`; returns `None` otherwise (or when the path
+/// does not exist on disk, which is normal for unsaved editor buffers).
+fn resolve_workspace_path(workspace_root: &std::path::Path, requested: &str) -> Option<PathBuf> {
+    let requested = std::path::Path::new(requested);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        workspace_root.join(requested)
+    };
+    let canonical = candidate.canonicalize().ok()?;
+    canonical.starts_with(workspace_root).then_some(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_rejects_paths_outside_workspace() {
+        let tmp = std::env::temp_dir().join(format!(
+            "token-saver-mcp-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let outside = tmp.parent().unwrap().join("..").join("..");
+        let resolved = resolve_workspace_path(&tmp, &outside.to_string_lossy());
+        // The escaped path (after canonicalization) must not start with tmp.
+        // Note: if `outside` happens to canonicalize back into tmp's parent
+        // chain it's still rejected because it isn't inside tmp.
+        assert!(
+            resolved.is_none()
+                || resolved
+                    .as_ref()
+                    .map(|p| p.starts_with(&tmp))
+                    .unwrap_or(false)
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn resolve_accepts_relative_path_inside_workspace() {
+        let tmp = std::env::temp_dir().join(format!(
+            "token-saver-mcp-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                + 1
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let inner = tmp.join("inner.rs");
+        std::fs::write(&inner, "fn main() {}").unwrap();
+        let resolved = resolve_workspace_path(&tmp, "inner.rs");
+        assert_eq!(resolved, Some(inner));
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

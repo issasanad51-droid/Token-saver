@@ -242,8 +242,7 @@ impl<S: VectorStore> VectorSync<S> {
 
     /// Decrypt a stored chunk's body locally (hydration helper).
     pub fn decrypt_chunk(&self, chunk: &ObfuscatedChunk) -> anyhow::Result<String> {
-        self.obfuscator
-            .decrypt(&chunk.nonce, &chunk.encrypted_body)
+        self.obfuscator.decrypt(&chunk.nonce, &chunk.encrypted_body)
     }
 }
 

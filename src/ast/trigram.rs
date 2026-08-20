@@ -6,6 +6,16 @@
 //! combines with semantic search in a hybrid retrieval strategy — exact
 //! variable names or text matches found via trigrams, meaning found via
 //! vectors, fused together (e.g. by the existing RRF engine).
+//!
+//! # Storage choice
+//!
+//! Both `index` (trigram → chunk-ids) and `trigrams` per doc use
+//! [`HashSet`](std::collections::HashSet) rather than `Vec`. This is important
+//! for correctness: a chunk whose source contains `foofoo` would otherwise
+//! have the trigram `"foo"` recorded twice, doubling its score against any
+//! query containing `"foo"`. Using a `HashSet` makes the per-trigram posting
+//! list a set membership signal — each chunk contributes at most once per
+//! trigram, which is what BM25/RRF downstream expect.
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,7 +25,7 @@ use crate::ast::chunker::AstChunk;
 #[derive(Debug, Clone)]
 pub struct TrigramHit {
     pub chunk_id: String,
-    /// Raw count of matching trigrams.
+    /// Number of distinct query trigrams that appear in the chunk.
     pub score: f64,
     /// Jaccard similarity between query and chunk trigram sets (0..1).
     pub jaccard: f64,
@@ -23,8 +33,8 @@ pub struct TrigramHit {
 
 /// A character n-gram inverted index over chunk text.
 pub struct TrigramIndex {
-    /// trigram -> chunk ids containing it.
-    index: HashMap<String, Vec<String>>,
+    /// trigram -> set of chunk ids containing it.
+    index: HashMap<String, HashSet<String>>,
     /// chunk id -> indexed document.
     docs: HashMap<String, TrigramDoc>,
     n: usize,
@@ -32,7 +42,7 @@ pub struct TrigramIndex {
 
 struct TrigramDoc {
     chunk: AstChunk,
-    trigrams: Vec<String>,
+    trigrams: HashSet<String>,
 }
 
 impl TrigramIndex {
@@ -60,23 +70,30 @@ impl TrigramIndex {
         }
         let trigrams = Self::trigrams(&chunk.source, self.n);
         for tg in &trigrams {
-            self.index.entry(tg.clone()).or_default().push(chunk.id.clone());
+            self.index
+                .entry(tg.clone())
+                .or_default()
+                .insert(chunk.id.clone());
         }
-        self.docs.insert(
-            chunk.id.clone(),
-            TrigramDoc {
-                chunk,
-                trigrams,
-            },
-        );
+        self.docs
+            .insert(chunk.id.clone(), TrigramDoc { chunk, trigrams });
     }
 
     /// Remove a chunk (e.g. on deletion detected by the Merkle diff).
+    ///
+    /// Posting lists that become empty after removal are dropped from the
+    /// `index` map so that incremental reindex over many add/remove cycles
+    /// does not leak dead trigram keys.
     pub fn remove(&mut self, chunk_id: &str) {
         if let Some(doc) = self.docs.remove(chunk_id) {
             for tg in doc.trigrams {
+                let mut drop_key = false;
                 if let Some(ids) = self.index.get_mut(&tg) {
-                    ids.retain(|id| id != chunk_id);
+                    ids.remove(chunk_id);
+                    drop_key = ids.is_empty();
+                }
+                if drop_key {
+                    self.index.remove(&tg);
                 }
             }
         }
@@ -113,15 +130,19 @@ impl TrigramIndex {
     /// raw matching-trigram count. This is the lexical signal fed into the
     /// hybrid fusion.
     pub fn search(&self, query: &str, top_k: usize) -> Vec<TrigramHit> {
-        let q_tris = Self::trigrams(query, self.n);
-        if q_tris.is_empty() {
+        if query.is_empty() {
             return Vec::new();
         }
-        let q_set: HashSet<&str> = q_tris.iter().map(String::as_str).collect();
+        let q_set = Self::trigrams(query, self.n);
+        if q_set.is_empty() {
+            return Vec::new();
+        }
 
-        // Accumulate raw overlap counts per candidate chunk.
+        // Accumulate raw overlap counts per candidate chunk. Each chunk
+        // contributes at most 1 per distinct query trigram because both the
+        // posting list and `q_set` are sets.
         let mut counts: HashMap<&str, f64> = HashMap::new();
-        for tg in &q_tris {
+        for tg in &q_set {
             if let Some(ids) = self.index.get(tg) {
                 for id in ids {
                     *counts.entry(id.as_str()).or_insert(0.0) += 1.0;
@@ -133,10 +154,13 @@ impl TrigramIndex {
             .into_iter()
             .filter_map(|(id, score)| {
                 let doc = self.docs.get(id)?;
-                let doc_set: HashSet<&str> = doc.trigrams.iter().map(String::as_str).collect();
-                let intersection = q_set.intersection(&doc_set).count() as f64;
-                let union = q_set.union(&doc_set).count() as f64;
-                let jaccard = if union > 0.0 { intersection / union } else { 0.0 };
+                let intersection = q_set.intersection(&doc.trigrams).count() as f64;
+                let union = q_set.union(&doc.trigrams).count() as f64;
+                let jaccard = if union > 0.0 {
+                    intersection / union
+                } else {
+                    0.0
+                };
                 Some(TrigramHit {
                     chunk_id: id.to_string(),
                     score,
@@ -174,11 +198,33 @@ impl TrigramIndex {
     // Trigram extraction
     // -----------------------------------------------------------------------
 
-    /// Extract all n-grams of `text` as `String`s.
-    fn trigrams(text: &str, n: usize) -> Vec<String> {
+    /// Extract all *distinct* n-grams of `text` as a `HashSet<String>`.
+    ///
+    /// Returns an empty set when:
+    ///   - `text` is empty, or
+    ///   - `text` has fewer than `n` characters *and* those characters are
+    ///     all whitespace.
+    ///
+    /// The "fewer than `n` chars" fallback previously returned a one-element
+    /// `Vec` containing the whole string — even for the empty string — which
+    /// silently defeated the empty-query early-return in [`search`](Self::search)
+    /// and polluted the inverted index with a `""` key. We now drop empty
+    /// trigrams entirely.
+    fn trigrams(text: &str, n: usize) -> HashSet<String> {
         let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            return HashSet::new();
+        }
         if chars.len() < n {
-            return vec![chars.iter().collect()];
+            // Only keep non-whitespace short-prefix trigrams; whitespace-only
+            // inputs would otherwise produce a `""`-like degenerate key.
+            let joined: String = chars.iter().collect();
+            if joined.trim().is_empty() {
+                return HashSet::new();
+            }
+            let mut set = HashSet::with_capacity(1);
+            set.insert(joined);
+            return set;
         }
         (0..=chars.len() - n)
             .map(|i| chars[i..i + n].iter().collect())
@@ -267,5 +313,52 @@ mod tests {
 
         // File b.rs chunks are gone
         assert!(idx.search("Beta", 5).is_empty());
+    }
+
+    /// Regression test: a chunk whose source contains the same trigram twice
+    /// (e.g. `"foofoo"`) must contribute at most 1 to the score of any query
+    /// that contains that trigram. With the old `Vec`-based posting list, the
+    /// chunk would have its id pushed twice into `index["foo"]`, inflating the
+    /// raw `score` field by 2x.
+    #[test]
+    fn duplicate_trigrams_in_chunk_do_not_inflate_score() {
+        let mut idx = TrigramIndex::new(3);
+        idx.add(chunk("dup", "foofoo")); // contains "foo" twice
+        idx.add(chunk("once", "foobar")); // contains "foo" once
+
+        let hits = idx.search("foo", 5);
+        assert_eq!(hits.len(), 2);
+        // Both chunks contain "foo" exactly once as a distinct trigram.
+        assert_eq!(hits[0].score, 1.0);
+        assert_eq!(hits[1].score, 1.0);
+    }
+
+    /// Regression test: an empty query must return zero hits immediately.
+    /// The previous implementation called `trigrams("", 3)` which yielded
+    /// `vec![""]`, so `q_tris.is_empty()` was `false` and the search
+    /// proceeded with a degenerate `""` trigram key.
+    #[test]
+    fn empty_query_returns_no_hits() {
+        let mut idx = TrigramIndex::new(3);
+        idx.add(chunk("a", "fn alpha() {}"));
+        assert!(idx.search("", 5).is_empty());
+    }
+
+    /// Regression test: removing the last chunk containing a given trigram
+    /// must also remove the trigram key from `index`. Otherwise incremental
+    /// reindex over many add/remove cycles grows the `index` map
+    /// monotonically with dead keys.
+    #[test]
+    fn remove_drops_empty_posting_lists() {
+        let mut idx = TrigramIndex::new(3);
+        idx.add(chunk("a", "fn alpha() {}"));
+        // The trigram "alp" should be in the index while chunk "a" exists.
+        assert!(idx.index.contains_key("alp"));
+        idx.remove("a");
+        // After removal the posting list for "alp" should be gone entirely.
+        assert!(
+            !idx.index.contains_key("alp"),
+            "trigram key leaked after removing the last chunk containing it"
+        );
     }
 }

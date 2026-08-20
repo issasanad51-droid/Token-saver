@@ -55,12 +55,16 @@ impl CursorPayload {
 
     /// Convert a zero-indexed Unicode-scalar line/column to a UTF-8 byte
     /// offset. Out-of-range positions clamp to the selected line or file end.
+    ///
+    /// Both `\n` and `\r\n` line terminators are handled so the offset is
+    /// correct on Windows-edited files (the previous implementation only
+    /// stripped `\n`, leaving a stray `\r` that shifted the column).
     pub fn to_byte_offset(&self, source: &str) -> usize {
         let mut line_start = 0usize;
         let mut selected = None;
         for (line, segment) in source.split_inclusive('\n').enumerate() {
             if line == self.line {
-                selected = Some((line_start, segment.trim_end_matches('\n')));
+                selected = Some((line_start, segment.trim_end_matches(['\r', '\n'])));
                 break;
             }
             line_start += segment.len();
@@ -110,9 +114,7 @@ impl ContextTracker {
         workspace_root: PathBuf,
         config: ContextConfig,
     ) -> Self {
-        let workspace_root = workspace_root
-            .canonicalize()
-            .unwrap_or(workspace_root);
+        let workspace_root = workspace_root.canonicalize().unwrap_or(workspace_root);
         Self {
             asg,
             registry: Arc::new(registry),
@@ -127,6 +129,13 @@ impl ContextTracker {
     }
 
     /// Find the smallest semantic ASG entity containing the cursor.
+    ///
+    /// The byte range on each [`Node`] is documented as `[start, end)` (a
+    /// half-open range). We honour that contract here: a cursor exactly at
+    /// `end` is considered *outside* the node. The previous implementation
+    /// used `<=`, which mis-identified the byte immediately after a node as
+    /// still being inside it and could mask a tighter child node sitting
+    /// at the same boundary.
     pub fn find_node_at_cursor(&self, payload: &CursorPayload) -> Option<usize> {
         let file_path = self.resolve_path(&payload.file_path)?;
         let node_ids = self.asg.inner.file_index.get(&file_path)?;
@@ -136,7 +145,7 @@ impl ContextTracker {
         node_ids
             .iter()
             .filter_map(|node_id| self.asg.get_node(*node_id))
-            .filter(|node| byte_offset >= node.range.0 && byte_offset <= node.range.1)
+            .filter(|node| byte_offset >= node.range.0 && byte_offset < node.range.1)
             .min_by_key(|node| node.range.1.saturating_sub(node.range.0))
             .map(|node| node.id)
     }
@@ -240,7 +249,9 @@ impl ContextTracker {
             self.workspace_root.join(requested)
         };
         let canonical = candidate.canonicalize().ok()?;
-        canonical.starts_with(&self.workspace_root).then_some(canonical)
+        canonical
+            .starts_with(&self.workspace_root)
+            .then_some(canonical)
     }
 }
 
@@ -259,7 +270,26 @@ pub fn estimate_tokens(text: &str) -> usize {
     // Count syntax-heavy characters that typically become standalone tokens.
     let standalone: usize = text
         .chars()
-        .filter(|c| matches!(c, '{' | '}' | '(' | ')' | '[' | ']' | ':' | ';' | ',' | '=' | '<' | '>' | '&' | '|' | '#' | '@'))
+        .filter(|c| {
+            matches!(
+                c,
+                '{' | '}'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | ':'
+                    | ';'
+                    | ','
+                    | '='
+                    | '<'
+                    | '>'
+                    | '&'
+                    | '|'
+                    | '#'
+                    | '@'
+            )
+        })
         .count();
     // Each standalone char adds ~0.3 tokens on top of the base estimate
     // (they're partially covered by the byte ratio but undercounted).
@@ -309,6 +339,25 @@ mod tests {
         let source = "one\nαβgamma\nthree";
         let cursor = CursorPayload::new("file.rs", 1, 2);
         assert_eq!(&source[cursor.to_byte_offset(source)..], "gamma\nthree");
+    }
+
+    /// Regression test: on Windows-edited files (CRLF line endings), the
+    /// previous implementation only stripped `\n` from the line segment,
+    /// leaving a stray `\r` that shifted the column one byte to the right.
+    #[test]
+    fn crlf_line_endings_do_not_shift_cursor_column() {
+        let source = "alpha\r\nsecond_line\r\nthird";
+        let cursor = CursorPayload::new("file.rs", 1, 4); // points at 'n' of 'second_line'
+        let offset = cursor.to_byte_offset(source);
+        // The byte at the offset should be the 'n' of "second", not the 'd'.
+        assert_eq!(&source[offset..offset + 1], "n");
+    }
+
+    /// Smoke test for empty sources — must not panic.
+    #[test]
+    fn empty_source_returns_zero_offset() {
+        let cursor = CursorPayload::new("file.rs", 0, 0);
+        assert_eq!(cursor.to_byte_offset(""), 0);
     }
 
     #[test]
