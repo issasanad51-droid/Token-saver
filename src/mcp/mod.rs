@@ -305,11 +305,12 @@ async fn handle_request(
                 }
                 "health" => {
                     let mem = memory_store.lock().await;
+                    let asg_snap = asg.snapshot();
                     let result = serde_json::json!({
-                        "nodes": asg.inner.nodes.len(),
-                        "edges": asg.inner.edges.len(),
-                        "files": asg.inner.file_index.len(),
-                        "symbols": asg.inner.symbol_table.len(),
+                        "nodes": asg_snap.nodes.len(),
+                        "edges": asg_snap.edges.len(),
+                        "files": asg_snap.file_index.len(),
+                        "symbols": asg_snap.symbol_table.len(),
                         "memories": mem.len()
                     });
                     drop(mem);
@@ -321,8 +322,8 @@ async fn handle_request(
                     )
                 }
                 "list_files" => {
-                    let files: Vec<serde_json::Value> = asg
-                        .inner
+                    let asg_snap = asg.snapshot();
+                    let files: Vec<serde_json::Value> = asg_snap
                         .file_index
                         .iter()
                         .map(|(path, node_ids)| {
@@ -348,18 +349,19 @@ async fn handle_request(
                     // reject anything that escapes it (same containment
                     // contract as the HTTP `context_handler`).
                     let resolved = resolve_workspace_path(workspace_root, file_path);
+                    let asg_snap = asg.snapshot();
                     let node_info = resolved.and_then(|path| {
                         let source = std::fs::read_to_string(&path).ok()?;
                         let byte_offset =
                             CursorPayload::new(file_path, line, column).to_byte_offset(&source);
-                        let node_ids = asg.inner.file_index.get(&path)?;
+                        let node_ids = asg_snap.file_index.get(&path)?;
                         // Pick the *smallest* node whose byte range contains
                         // the cursor — the previous implementation returned the
                         // first node in the file regardless of cursor
                         // position, which made `line` and `column` no-ops.
                         node_ids
                             .iter()
-                            .filter_map(|id| asg.get_node(*id))
+                            .filter_map(|id| asg_snap.nodes.get(*id))
                             .filter(|node| {
                                 byte_offset >= node.range.0 && byte_offset < node.range.1
                             })

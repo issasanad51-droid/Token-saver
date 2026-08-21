@@ -638,28 +638,71 @@ fn runtime_edge_kind(kind: graph::EdgeKind) -> EdgeKind {
     }
 }
 
-/// A shared, thread-safe ASG handle for concurrent access.
+/// A shared, swappable ASG handle for concurrent access.
+///
+/// Under the hood this wraps an [`arc_swap::ArcSwap<Asg>`], so reads are
+/// wait-free and a freshly-rebuilt ASG can be published atomically via
+/// [`swap`](Self::swap). Outstanding readers continue to see the snapshot
+/// they loaded until they drop it; the old `Asg` is reclaimed once the last
+/// reader releases it.
+///
+/// Why ArcSwap instead of `Arc<RwLock<Asg>>`? The hot paths
+/// (semantic search, BM25, PPR) all iterate `asg.nodes` and call
+/// `get_node` per result; an `RwLock` read-guard per access would serialise
+/// those reads needlessly. `ArcSwap::load_full` returns a ref-counted
+/// `Arc<Asg>` snapshot with no lock contention.
+///
+/// # Migration note
+///
+/// `get_node` and `get_node_by_name` previously returned `Option<&Node>`
+/// borrowing from `&self`. With ArcSwap, those borrows can't outlive the
+/// `Guard`, so the methods now return owned `Option<Node>`. The clone is
+/// cheap (a `String` for `name`/`kind`/`source`/`tracker_id`/`file_path`
+/// plus two `usize`/`f64`s) and the call sites were already either cloning
+/// the fields they cared about or only reading a single field.
 #[derive(Clone)]
 pub struct SharedAsg {
-    pub inner: Arc<Asg>,
+    pub inner: Arc<arc_swap::ArcSwap<Asg>>,
 }
 
 impl SharedAsg {
     pub fn new(asg: Asg) -> Self {
         Self {
-            inner: Arc::new(asg),
+            inner: Arc::new(arc_swap::ArcSwap::from_pointee(asg)),
         }
     }
 
-    pub fn get_node(&self, id: usize) -> Option<&Node> {
-        self.inner.nodes.get(id)
+    /// Load a ref-counted snapshot of the current ASG.
+    ///
+    /// The returned `Arc<Asg>` stays valid until every reader drops it —
+    /// a subsequent [`swap`](Self::swap) does *not* invalidate outstanding
+    /// snapshots. Callers that need a consistent view across multiple
+    /// reads (e.g. a full search pass) should call this once and reuse the
+    /// snapshot.
+    pub fn snapshot(&self) -> Arc<Asg> {
+        self.inner.load_full()
     }
 
-    pub fn get_node_by_name(&self, name: &str) -> Option<&Node> {
-        self.inner
-            .symbol_table
+    /// Atomically publish a freshly-rebuilt ASG. Outstanding readers keep
+    /// using the previous snapshot until they drop it; the old ASG is then
+    /// reclaimed.
+    pub fn swap(&self, asg: Asg) {
+        self.inner.store(Arc::new(asg));
+    }
+
+    /// Look up a node by dense runtime id. Returns an owned `Node` (the
+    /// clone is unavoidable under ArcSwap since the snapshot is shared).
+    pub fn get_node(&self, id: usize) -> Option<Node> {
+        self.snapshot().nodes.get(id).cloned()
+    }
+
+    /// Look up a node by short name or fully-qualified tracker id.
+    pub fn get_node_by_name(&self, name: &str) -> Option<Node> {
+        let snap = self.snapshot();
+        snap.symbol_table
             .get(name)
-            .and_then(|id| self.inner.nodes.get(*id))
+            .and_then(|id| snap.nodes.get(*id))
+            .cloned()
     }
 }
 

@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tracing::info;
 
-use crate::asg::{Node, PageRankEngine, PersonalizedPageRankConfig, SharedAsg};
+use crate::asg::{Asg, Node, PageRankEngine, PersonalizedPageRankConfig, SharedAsg};
 use crate::compressor::ChunkRegistry;
 use rrf::{RankedDoc, RrfConfig};
 
@@ -141,6 +142,13 @@ impl SearchEngine {
         &self.config
     }
 
+    /// Borrow the shared ASG handle. Useful for callers (and tests) that
+    /// need to snapshot the current ASG or to publish a freshly-rebuilt
+    /// one via [`SharedAsg::swap`].
+    pub fn asg(&self) -> &SharedAsg {
+        &self.asg
+    }
+
     // Note: temporal decay (`apply_temporal_decay` / `touch_access`) was
     // removed. The previous implementation was a no-op: `touch_access()` was
     // called *before* `structural_search` read `last_access`, so `elapsed`
@@ -157,13 +165,16 @@ impl SearchEngine {
     /// Also precomputes the BM25 corpus statistics (`document_frequency` and
     /// `average_doc_len`) so per-query BM25 is O(Q) instead of O(N·Q).
     pub async fn precompute_embeddings(&self) {
+        // Take a single ASG snapshot so the precompute sees a consistent
+        // view even if a reindex swap happens concurrently.
+        let asg = self.asg.snapshot();
         let mut embeddings = self.embeddings.write().await;
         let mut doc_terms = self.document_terms.write().await;
         embeddings.clear();
         doc_terms.clear();
-        for node in &self.asg.inner.nodes {
+        for node in &asg.nodes {
             if self.is_searchable(node.id) {
-                let ctx_text = contextual_text(node, &self.asg.inner);
+                let ctx_text = contextual_text(node, &asg);
                 embeddings.insert(node.id, embed_text(&ctx_text));
                 doc_terms.insert(node.id, tokenize(&ctx_text));
             }
@@ -192,6 +203,43 @@ impl SearchEngine {
         *self.average_doc_len.write().await = avg_len;
     }
 
+    /// Publish a freshly-rebuilt ASG and invalidate every cached artefact that
+    /// depends on it (embeddings, document terms, document-frequency table,
+    /// average doc length). The next search call repopulates the caches via
+    /// [`precompute_embeddings`](Self::precompute_embeddings).
+    ///
+    /// Callers are expected to also rebuild the [`ChunkRegistry`] (so
+    /// `is_searchable` reflects the new ASG's node ids) before invoking this
+    /// — otherwise `precompute_embeddings` will skip every node.
+    ///
+    /// # Race-condition safety
+    ///
+    /// Outstanding searches already hold an `Arc<Asg>` snapshot from
+    /// [`SharedAsg::snapshot`]; they keep using that snapshot until they drop
+    /// it. The new ASG only becomes visible to *new* searches. Searches that
+    /// start *during* this call may see an empty cache and trigger
+    /// `precompute_embeddings` against the *new* ASG (because the swap
+    /// happens-before the cache clear in this method); that is correct.
+    pub async fn refresh_after_reindex(&self, new_asg: Asg) {
+        info!(
+            "refresh_after_reindex: swapping ASG ({} nodes -> {} nodes) and invalidating caches",
+            self.asg.snapshot().nodes.len(),
+            new_asg.nodes.len()
+        );
+        // Swap first so any concurrent `precompute_embeddings` call (started
+        // by a search) sees the new ASG. Clearing the caches second means a
+        // search that already snapshotted the old ASG but hasn't yet read the
+        // caches will find them empty and recompute against the *new* ASG —
+        // which is correct (the old snapshot's ids will simply not match any
+        // chunk in the registry, so the search returns empty results rather
+        // than returning stale ones).
+        self.asg.swap(new_asg);
+        self.embeddings.write().await.clear();
+        self.document_terms.write().await.clear();
+        self.document_frequency.write().await.clear();
+        *self.average_doc_len.write().await = 0.0;
+    }
+
     /// Search without editor context.
     pub async fn search(&self, query: &str, top_k: usize) -> Vec<MergedResult> {
         self.search_with_context(query, top_k, None).await
@@ -206,7 +254,10 @@ impl SearchEngine {
         top_k: usize,
         context_node: Option<usize>,
     ) -> Vec<MergedResult> {
-        if top_k == 0 || query.trim().is_empty() || self.asg.inner.nodes.is_empty() {
+        // Snapshot the ASG once for the whole query so all three streams see
+        // a consistent graph even if a reindex swap happens mid-search.
+        let asg_snapshot = self.asg.snapshot();
+        if top_k == 0 || query.trim().is_empty() || asg_snapshot.nodes.is_empty() {
             return Vec::new();
         }
         if self.embeddings.read().await.is_empty() {
@@ -216,10 +267,10 @@ impl SearchEngine {
         let pool_size = top_k
             .saturating_mul(self.config.candidate_multiplier.max(1))
             .max(top_k)
-            .min(self.asg.inner.nodes.len());
+            .min(asg_snapshot.nodes.len());
 
         let query_vector = embed_text(query);
-        let vector_asg = self.asg.clone();
+        let vector_asg = asg_snapshot.clone();
         let vector_embeddings = self.embeddings.clone();
         let vector_registry = self.registry.clone();
         let semantic_floor = if self.config.semantic_min_score.is_finite() {
@@ -239,7 +290,7 @@ impl SearchEngine {
             .await
         });
 
-        let lexical_asg = self.asg.clone();
+        let lexical_asg = asg_snapshot.clone();
         let lexical_registry = self.registry.clone();
         let lexical_query = query.to_owned();
         let k1 = self.config.bm25_k1;
@@ -266,7 +317,7 @@ impl SearchEngine {
         let lexical = lexical_task.await.unwrap_or_default();
 
         let seeds = self.ppr_seeds(&semantic, &lexical, context_node);
-        let structural_asg = self.asg.clone();
+        let structural_asg = asg_snapshot.clone();
         let structural_registry = self.registry.clone();
         let ppr_config = self.config.ppr.clone();
         let structural = tokio::task::spawn_blocking(move || {
@@ -293,7 +344,7 @@ impl SearchEngine {
     // -----------------------------------------------------------------------
 
     async fn semantic_search(
-        asg: SharedAsg,
+        asg: Arc<Asg>,
         registry: Arc<ChunkRegistry>,
         embeddings: Arc<RwLock<HashMap<usize, Vec<f64>>>>,
         query_vector: Vec<f64>,
@@ -303,7 +354,7 @@ impl SearchEngine {
         let embeddings = embeddings.read().await;
         let mut results = Vec::new();
         for (node_id, node_vector) in embeddings.iter() {
-            if asg.get_node(*node_id).is_none() || !registry.chunks.contains_key(node_id) {
+            if asg.nodes.get(*node_id).is_none() || !registry.chunks.contains_key(node_id) {
                 continue;
             }
             let score = cosine_similarity(&query_vector, node_vector);
@@ -325,7 +376,7 @@ impl SearchEngine {
     // -----------------------------------------------------------------------
 
     async fn bm25_search(
-        asg: SharedAsg,
+        asg: Arc<Asg>,
         registry: Arc<ChunkRegistry>,
         caches: Bm25Caches,
         query: &str,
@@ -343,20 +394,18 @@ impl SearchEngine {
         // re-tokenizing from searchable text.
         let cached = caches.document_terms.read().await;
         let documents: Vec<(usize, Vec<String>)> = if !cached.is_empty() {
-            asg.inner
-                .nodes
+            asg.nodes
                 .iter()
                 .filter(|node| registry.chunks.contains_key(&node.id))
                 .filter_map(|node| cached.get(&node.id).map(|terms| (node.id, terms.clone())))
                 .collect()
         } else {
             drop(cached);
-            asg.inner
-                .nodes
+            asg.nodes
                 .iter()
                 .filter(|node| registry.chunks.contains_key(&node.id))
                 .map(|node| {
-                    let ctx_text = contextual_text(node, &asg.inner);
+                    let ctx_text = contextual_text(node, &asg);
                     (node.id, tokenize(&ctx_text))
                 })
                 .collect()
@@ -482,14 +531,14 @@ impl SearchEngine {
     }
 
     fn structural_search(
-        asg: SharedAsg,
+        asg: Arc<Asg>,
         registry: Arc<ChunkRegistry>,
         config: PersonalizedPageRankConfig,
         seeds: Vec<(usize, f64)>,
         top_k: usize,
     ) -> Vec<SearchResult> {
         let engine = PageRankEngine::from_config(config);
-        let scores = engine.personalized_scores(&asg.inner, &seeds);
+        let scores = engine.personalized_scores(&asg, &seeds);
 
         let mut results: Vec<SearchResult> = scores
             .into_iter()

@@ -557,11 +557,12 @@ pub async fn health_handler(State(state): State<ServerState>) -> impl IntoRespon
     let trigram = state.indexes.trigram.read().await;
     let merkle = state.indexes.merkle.read().await;
     let memory_count = state.memory_store.lock().await.len();
+    let asg_snap = state.asg.snapshot();
     Json(HealthResponse {
         status: "ok",
         workspace: state.workspace.display().to_string(),
-        asg_nodes: state.asg.inner.nodes.len(),
-        asg_edges: state.asg.inner.edges.len(),
+        asg_nodes: asg_snap.nodes.len(),
+        asg_edges: asg_snap.edges.len(),
         compressed_chunks: state.registry.chunks.len(),
         ast_chunks: trigram.len(),
         merkle_root: merkle.root_hash(),
@@ -639,9 +640,10 @@ pub async fn stats_handler(State(state): State<ServerState>) -> impl IntoRespons
     let trigram = state.indexes.trigram.read().await;
     let merkle = state.indexes.merkle.read().await;
     let mem = state.memory_store.lock().await;
+    let asg_snap = state.asg.snapshot();
 
     let mut edge_kinds: HashMap<String, usize> = HashMap::new();
-    for edge in &state.asg.inner.edges {
+    for edge in &asg_snap.edges {
         let label = crate::asg::edge_kind_label(edge.kind);
         *edge_kinds.entry(label.to_string()).or_default() += 1;
     }
@@ -655,8 +657,8 @@ pub async fn stats_handler(State(state): State<ServerState>) -> impl IntoRespons
 
     Json(StatsResponse {
         workspace: state.workspace.display().to_string(),
-        asg_nodes: state.asg.inner.nodes.len(),
-        asg_edges: state.asg.inner.edges.len(),
+        asg_nodes: asg_snap.nodes.len(),
+        asg_edges: asg_snap.edges.len(),
         asg_edge_kinds: edge_kinds,
         compressed_chunks: state.registry.chunks.len(),
         bytes_saved,
@@ -753,21 +755,22 @@ pub async fn graph_node_handler(
     State(state): State<ServerState>,
     Path(node_id): Path<usize>,
 ) -> Response {
-    let Some(node) = state.asg.get_node(node_id) else {
+    // Snapshot once so the node lookup, adjacency lists, and edge traversal
+    // all see a consistent graph even if a reindex swap happens concurrently.
+    let asg = state.asg.snapshot();
+    let Some(node) = asg.nodes.get(node_id) else {
         return (StatusCode::NOT_FOUND, "node not found").into_response();
     };
 
-    let incoming: Vec<GraphEdge> = state
-        .asg
-        .inner
+    let incoming: Vec<GraphEdge> = asg
         .reverse_adjacency
         .get(&node_id)
         .map(|edge_ids| {
             edge_ids
                 .iter()
                 .filter_map(|&eid| {
-                    let edge = &state.asg.inner.edges[eid];
-                    state.asg.get_node(edge.from).map(|n| GraphEdge {
+                    let edge = &asg.edges[eid];
+                    asg.nodes.get(edge.from).map(|n| GraphEdge {
                         node_id: n.id,
                         node_name: n.name.clone(),
                         kind: crate::asg::edge_kind_label(edge.kind).to_string(),
@@ -777,17 +780,15 @@ pub async fn graph_node_handler(
         })
         .unwrap_or_default();
 
-    let outgoing: Vec<GraphEdge> = state
-        .asg
-        .inner
+    let outgoing: Vec<GraphEdge> = asg
         .adjacency
         .get(&node_id)
         .map(|edge_ids| {
             edge_ids
                 .iter()
                 .filter_map(|&eid| {
-                    let edge = &state.asg.inner.edges[eid];
-                    state.asg.get_node(edge.to).map(|n| GraphEdge {
+                    let edge = &asg.edges[eid];
+                    asg.nodes.get(edge.to).map(|n| GraphEdge {
                         node_id: n.id,
                         node_name: n.name.clone(),
                         kind: crate::asg::edge_kind_label(edge.kind).to_string(),
@@ -821,39 +822,125 @@ pub struct ReindexResponse {
     pub message: String,
 }
 
+/// Rebuild every in-memory artefact that depends on the source tree and
+/// atomically publish the new state to the live retrieval pipeline.
+///
+/// This is the "reindex actually refreshes the search engine" path. It
+/// rebuilds, in order:
+///
+/// 1. **ASG** via [`crate::asg::build_asg_from_dir_with_config`] — parses
+///    every `.rs` file in the workspace, resolves cross-file edges, runs
+///    weighted Personalized PageRank. The result is an `Asg` ready to be
+///    published.
+/// 2. **ChunkRegistry** via [`ChunkCompressor::compress_asg`] — compresses
+///    every functional node into a `CompressedChunk`. The old registry is
+///    cleared first so stale node ids don't linger.
+/// 3. **TrigramIndex** and **MerkleTree** — rebuilt from the freshly-parsed
+///    chunks. The trigram index is replaced atomically; the Merkle tree
+///    likewise.
+/// 4. **SearchEngine caches** via [`SearchEngine::refresh_after_reindex`] —
+///    swaps the new ASG into `SharedAsg` (atomic via `ArcSwap`) and clears
+///    the embeddings / document_terms / document_frequency / average_doc_len
+///    caches. The next search call repopulates them against the new ASG.
+///
+/// # Atomicity
+///
+/// Each artefact is published independently (ASG via `ArcSwap::store`,
+/// registry via `clear()` + `register()` loop, trigram via `RwLock` write,
+/// etc.). A search that arrives mid-reindex may see a *partial* refresh
+/// (e.g. new ASG but stale registry). That is safe but may yield empty
+/// results for one query. The next query will see the full refresh.
+///
+/// Full transactionality across all five artefacts would require a global
+/// `RwLock<()>` taken for write during reindex — we judge the extra
+/// serialization not worth it for the typical "edit a file, save, wait a
+/// few hundred ms for reindex" workflow.
+pub async fn refresh_pipeline_after_reindex(
+    workspace: &std::path::Path,
+    ppr_config: &crate::asg::PersonalizedPageRankConfig,
+    registry: &crate::compressor::ChunkRegistry,
+    indexes: &crate::watcher::reindex::SharedIndexes,
+    search_engine: &crate::search::SearchEngine,
+) -> anyhow::Result<()> {
+    use crate::asg::build_asg_from_dir_with_config;
+    use crate::compressor::ChunkCompressor;
+
+    // 1. Parse + rank the new ASG. This is the slow step — typically a few
+    //    hundred ms for a small-to-medium workspace.
+    let new_asg = build_asg_from_dir_with_config(workspace, ppr_config.clone())?;
+    info!(
+        "reindex: rebuilt ASG ({} nodes, {} edges)",
+        new_asg.nodes.len(),
+        new_asg.edges.len()
+    );
+
+    // 2. Re-compress every functional node into a fresh ChunkRegistry
+    //    payload. The registry is `DashMap`-backed so we can clear + refill
+    //    it in place without taking a long-lived write lock.
+    let mut compressor = ChunkCompressor::new();
+    let new_registry = compressor.compress_asg(&new_asg);
+    let new_chunk_count = new_registry.chunks.len();
+    registry.clear();
+    for entry in new_registry.chunks.iter() {
+        registry.register(entry.value().clone());
+    }
+    info!("reindex: re-compressed {} chunks", new_chunk_count);
+
+    // 3. Rebuild the trigram + Merkle indexes by re-chunking the workspace.
+    //    The trigram index is keyed by *chunk source text* (not compressed
+    //    aliases), so it must be rebuilt from real source — feeding compressed
+    //    aliases into the trigram index would corrupt lexical search.
+    {
+        use crate::ast::chunker::AstChunker;
+        let mut chunker = AstChunker::new()
+            .map_err(|e| anyhow::anyhow!("failed to create chunker: {e}"))?
+            .with_crate_root(workspace);
+        let chunks = chunker.chunk_dir(workspace)?;
+        let mut trigram = indexes.trigram.write().await;
+        *trigram = crate::ast::trigram::TrigramIndex::new(3);
+        trigram.index(&chunks);
+        let new_merkle = crate::ast::merkle::MerkleTree::build(&chunks);
+        *indexes.merkle.write().await = new_merkle;
+        info!(
+            "reindex: rebuilt trigram + merkle ({} chunks)",
+            chunks.len()
+        );
+    }
+
+    // 4. Atomically swap the new ASG into SharedAsg and clear the search
+    //    engine caches. The next search repopulates them.
+    //
+    // Note: `SearchEngine` holds its own `SharedAsg` internally — that's the
+    // one it swaps here. The `ServerState` and `ContextTracker` hold clones
+    // of the *same* `SharedAsg` (because `SharedAsg` wraps `Arc<ArcSwap<Asg>>`),
+    // so the swap is visible to all readers automatically.
+    search_engine.refresh_after_reindex(new_asg).await;
+
+    Ok(())
+}
+
 pub async fn reindex_handler(State(state): State<ServerState>) -> impl IntoResponse {
     let workspace = state.workspace.clone();
     let indexes = state.indexes.clone();
+    let registry = state.registry.clone();
+    let search_engine = state.search_engine.clone();
+    let ppr_config = state.search_engine.config().ppr.clone();
 
-    // Run a full re-chunk + index update in the background.
+    // Run the full pipeline refresh in the background.
     tokio::spawn(async move {
-        let mut chunker = match AstChunker::new() {
-            Ok(c) => c.with_crate_root(workspace.as_path()),
-            Err(e) => {
-                warn!("reindex: failed to create chunker: {e}");
-                return;
-            }
-        };
-
-        let chunks = match chunker.chunk_dir(workspace.as_path()) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("reindex: failed to chunk workspace: {e}");
-                return;
-            }
-        };
-
-        // Rebuild trigram index.
-        let mut trigram = indexes.trigram.write().await;
-        *trigram = TrigramIndex::new(3);
-        trigram.index(&chunks);
-        drop(trigram);
-
-        // Rebuild merkle tree.
-        let new_merkle = MerkleTree::build(&chunks);
-        *indexes.merkle.write().await = new_merkle;
-
-        info!("manual reindex complete: {} chunks", chunks.len());
+        let started = std::time::Instant::now();
+        match refresh_pipeline_after_reindex(
+            workspace.as_path(),
+            &ppr_config,
+            &registry,
+            &indexes,
+            search_engine.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => info!("manual reindex complete in {:?}", started.elapsed()),
+            Err(e) => warn!("manual reindex failed: {e:#}"),
+        }
     });
 
     Json(ReindexResponse {
@@ -936,6 +1023,7 @@ pub async fn metrics_handler(State(state): State<ServerState>) -> impl IntoRespo
     };
 
     let mem = state.memory_store.lock().await;
+    let asg_snap = state.asg.snapshot();
     Json(MetricsResponse {
         total_requests,
         total_tokens_served: total_tokens,
@@ -946,8 +1034,8 @@ pub async fn metrics_handler(State(state): State<ServerState>) -> impl IntoRespo
         uptime_secs: uptime,
         requests_per_second: rps,
         memory_count: mem.len(),
-        asg_nodes: state.asg.inner.nodes.len(),
-        asg_edges: state.asg.inner.edges.len(),
+        asg_nodes: asg_snap.nodes.len(),
+        asg_edges: asg_snap.edges.len(),
     })
 }
 
@@ -1107,7 +1195,7 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
 
     // Save to persistent store if available.
     if let Some(ref store) = state.persistent_store {
-        if let Err(e) = store.save_asg(&state.asg.inner) {
+        if let Err(e) = store.save_asg(&state.asg.snapshot()) {
             warn!("failed to save ASG to persistent store: {e}");
         }
         let mem = state.memory_store.lock().await;
@@ -1117,8 +1205,16 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
     }
 
     // Start file watcher with reindex worker in the background.
+    //
+    // We give the worker a `RefreshTarget::with_pipeline` so file changes
+    // propagate not just to trigram+merkle but also to the live ASG, the
+    // ChunkRegistry, and the SearchEngine caches. This is what makes
+    // `editor saves -> search sees new code` actually work end-to-end.
     let watcher_workspace = workspace.clone();
     let watcher_indexes = state.indexes.clone();
+    let watcher_registry = state.registry.clone();
+    let watcher_search_engine = state.search_engine.clone();
+    let watcher_ppr = state.search_engine.config().ppr.clone();
     let watcher_debounce = std::time::Duration::from_millis(
         std::env::var("TOKEN_SAVER_WATCHER_DEBOUNCE")
             .ok()
@@ -1127,10 +1223,36 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
     );
     tokio::spawn(async move {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // The pipeline hook owns clones of the handles the refresh function
+        // needs. It's invoked on every debounce cycle.
+        let hook_workspace = watcher_workspace.clone();
+        let hook_registry = watcher_registry.clone();
+        let hook_indexes = watcher_indexes.clone();
+        let hook_search_engine = watcher_search_engine.clone();
+        let hook_ppr = watcher_ppr.clone();
+        let pipeline_hook: crate::watcher::reindex::PipelineRefreshHook = Arc::new(move || {
+            let workspace = hook_workspace.clone();
+            let registry = hook_registry.clone();
+            let indexes = hook_indexes.clone();
+            let search_engine = hook_search_engine.clone();
+            let ppr = hook_ppr.clone();
+            Box::pin(async move {
+                refresh_pipeline_after_reindex(
+                    workspace.as_path(),
+                    &ppr,
+                    &registry,
+                    &indexes,
+                    search_engine.as_ref(),
+                )
+                .await
+            })
+        });
+        let refresh_target =
+            crate::watcher::reindex::RefreshTarget::with_pipeline(watcher_indexes, pipeline_hook);
         let watcher_task = crate::watcher::watch_workspace(watcher_workspace.clone(), tx);
         let reindex_task = crate::watcher::reindex::run_reindex_worker(
             watcher_workspace,
-            watcher_indexes,
+            refresh_target,
             rx,
             watcher_debounce,
         );
@@ -1176,7 +1298,7 @@ pub async fn run_server_with_config(config: TokenSaverConfig) -> anyhow::Result<
             // Persist ASG and memories to redb on shutdown.
             if let Some(ref store) = shutdown_state.persistent_store {
                 info!("saving ASG and memories to persistent store before exit");
-                if let Err(e) = store.save_asg(&shutdown_state.asg.inner) {
+                if let Err(e) = store.save_asg(&shutdown_state.asg.snapshot()) {
                     warn!("failed to save ASG on shutdown: {e}");
                 }
                 let mem = shutdown_state.memory_store.lock().await;

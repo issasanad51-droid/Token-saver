@@ -138,13 +138,17 @@ impl ContextTracker {
     /// at the same boundary.
     pub fn find_node_at_cursor(&self, payload: &CursorPayload) -> Option<usize> {
         let file_path = self.resolve_path(&payload.file_path)?;
-        let node_ids = self.asg.inner.file_index.get(&file_path)?;
         let source = std::fs::read_to_string(&file_path).ok()?;
         let byte_offset = payload.to_byte_offset(&source);
+        // Snapshot the ASG once so the file_index lookup and the per-node
+        // range filter see a consistent graph (otherwise a concurrent reindex
+        // swap could give us an index that doesn't match the nodes we read).
+        let asg = self.asg.snapshot();
+        let node_ids = asg.file_index.get(&file_path)?;
 
         node_ids
             .iter()
-            .filter_map(|node_id| self.asg.get_node(*node_id))
+            .filter_map(|node_id| asg.nodes.get(*node_id))
             .filter(|node| byte_offset >= node.range.0 && byte_offset < node.range.1)
             .min_by_key(|node| node.range.1.saturating_sub(node.range.0))
             .map(|node| node.id)

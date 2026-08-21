@@ -88,6 +88,14 @@ impl ChunkRegistry {
         self.chunks.insert(chunk.node_id, chunk);
     }
 
+    /// Drop every registered chunk. Used by the reindex path so the
+    /// post-reindex registry only contains chunks for the *new* ASG's node
+    /// ids. Without this, `is_searchable` would report `true` for stale node
+    /// ids whose underlying source has been deleted or renumbered.
+    pub fn clear(&self) {
+        self.chunks.clear();
+    }
+
     /// Hydrate (decompress) a chunk back to original source.
     pub fn hydrate(&self, node_id: usize) -> Option<String> {
         let chunk = self.chunks.get(&node_id)?;
@@ -437,8 +445,7 @@ macro_rules! consume_matcher {
         } else {
             // Reconstruct the round-trip by hand via hydrate semantics.
             let mut out = chunk.compressed_source.clone();
-            let mut aliases: Vec<(&String, &String)> =
-                chunk.reverse_dictionary.iter().collect();
+            let mut aliases: Vec<(&String, &String)> = chunk.reverse_dictionary.iter().collect();
             aliases.sort_by_key(|(token, _)| std::cmp::Reverse(token.len()));
             for (token, original) in aliases {
                 out = out.replace(token, original);

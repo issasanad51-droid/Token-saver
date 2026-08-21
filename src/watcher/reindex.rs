@@ -35,6 +35,44 @@ impl SharedIndexes {
     }
 }
 
+/// The full set of artefacts the reindex worker can refresh.
+///
+/// When [`RefreshTarget::pipeline`] is `Some`, the worker calls
+/// [`crate::server::refresh_pipeline_after_reindex`] on every debounce
+/// cycle, so file changes propagate not just to trigram+merkle but also to
+/// the live ASG, ChunkRegistry, and SearchEngine caches. When it's `None`,
+/// the worker falls back to the legacy trigram+merkle-only refresh.
+#[derive(Clone)]
+pub struct RefreshTarget {
+    pub indexes: SharedIndexes,
+    /// Optional full-pipeline refresh hook. Set by the HTTP server at
+    /// startup so the file watcher gets the same treatment as `/v1/reindex`.
+    /// See [`crate::server::refresh_pipeline_after_reindex`] for the contract.
+    pub pipeline: Option<PipelineRefreshHook>,
+}
+
+/// Type-erased handle to the full-pipeline refresh function. We use a
+/// closure here so the `watcher` crate doesn't need to depend on the
+/// `server` crate (which would be a circular dep).
+pub type PipelineRefreshHook =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
+
+impl RefreshTarget {
+    pub fn new(indexes: SharedIndexes) -> Self {
+        Self {
+            indexes,
+            pipeline: None,
+        }
+    }
+
+    pub fn with_pipeline(indexes: SharedIndexes, hook: PipelineRefreshHook) -> Self {
+        Self {
+            indexes,
+            pipeline: Some(hook),
+        }
+    }
+}
+
 /// Stats reported after each re-index cycle.
 #[derive(Debug, Clone, Default)]
 pub struct ReindexReport {
@@ -52,16 +90,23 @@ pub struct ReindexReport {
 
 /// Run the re-index worker: receives file change events, debounces them,
 /// and applies incremental updates to the shared indexes.
+///
+/// If `target.pipeline` is set, the worker calls the full-pipeline refresh
+/// hook (which rebuilds the ASG, ChunkRegistry, and SearchEngine caches too)
+/// on every debounce cycle, so file changes propagate not just to trigram
+/// +merkle but to the live retrieval pipeline as well. When it's `None`,
+/// the worker falls back to the legacy trigram+merkle-only refresh.
 pub async fn run_reindex_worker(
     workspace: PathBuf,
-    indexes: SharedIndexes,
+    target: RefreshTarget,
     mut rx: mpsc::UnboundedReceiver<FileChangeEvent>,
     debounce: Duration,
 ) {
     info!(
-        "reindex worker started for {} (debounce: {}ms)",
+        "reindex worker started for {} (debounce: {}ms, full_pipeline: {})",
         workspace.display(),
-        debounce.as_millis()
+        debounce.as_millis(),
+        target.pipeline.is_some()
     );
 
     loop {
@@ -98,20 +143,43 @@ pub async fn run_reindex_worker(
             }
         }
 
-        // Deduplicate: only care about the latest kind per path.
+        // Deduplicate: only care about the latest kind per path. The hook
+        // doesn't actually need this set — it does a full rebuild — but we
+        // keep it for the legacy fallback path and for the log message.
         let mut changes: HashSet<(PathBuf, ChangeKind)> = HashSet::new();
         for event in pending {
             changes.insert((event.path, event.kind));
         }
 
-        let report = apply_incremental_update(&workspace, &indexes, &changes).await;
-        info!(
-            "reindex cycle complete: {} files, {} added, {} removed, {} changed",
-            report.files_processed,
-            report.chunks_added,
-            report.chunks_removed,
-            report.chunks_changed
-        );
+        if let Some(hook) = target.pipeline.as_ref() {
+            // Full-pipeline refresh: rebuild ASG + registry + search caches
+            // + trigram + merkle in one pass. The hook owns the workspace +
+            // SharedAsg + ChunkRegistry + SearchEngine, so it can do
+            // everything `/v1/reindex` does.
+            let started = std::time::Instant::now();
+            match hook().await {
+                Ok(()) => info!(
+                    "reindex cycle complete via full pipeline in {:?} ({} file changes)",
+                    started.elapsed(),
+                    changes.len()
+                ),
+                Err(e) => warn!("reindex full-pipeline refresh failed: {e:#}"),
+            }
+            // The hook already rebuilds trigram + merkle internally, so
+            // there's nothing left to do here.
+        } else {
+            // Legacy fallback: trigram + merkle only (no ASG/registry/search
+            // refresh). Retained so the watcher can be used standalone (e.g.
+            // in tests that don't have a SearchEngine).
+            let report = apply_incremental_update(&workspace, &target.indexes, &changes).await;
+            info!(
+                "reindex cycle complete: {} files, {} added, {} removed, {} changed",
+                report.files_processed,
+                report.chunks_added,
+                report.chunks_removed,
+                report.chunks_changed
+            );
+        }
     }
 }
 
