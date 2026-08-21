@@ -6,6 +6,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::asg::SharedAsg;
+use crate::ast::{PostprocessConfig, PruneConfig};
 use crate::compressor::ChunkRegistry;
 use crate::search::SearchEngine;
 
@@ -24,6 +25,10 @@ pub struct ContextConfig {
     pub max_context_tokens: usize,
     /// Independent cap for compressed dependency chunks.
     pub dependency_token_budget: usize,
+    /// Controls AST-based signature pruning for low-rank dependencies.
+    pub prune: PruneConfig,
+    /// Controls query-time post-processing (aliasing, whitespace, mono, sort).
+    pub postprocess: PostprocessConfig,
 }
 
 impl Default for ContextConfig {
@@ -33,6 +38,8 @@ impl Default for ContextConfig {
             max_dependencies: 5,
             max_context_tokens: 4_000,
             dependency_token_budget: 2_400,
+            prune: PruneConfig::default(),
+            postprocess: PostprocessConfig::default(),
         }
     }
 }
@@ -164,6 +171,13 @@ impl ContextTracker {
 
     /// Retrieve dependencies with query/cursor-personalized PPR and pack them
     /// greedily under the configured token budget.
+    ///
+    /// The pipeline has four phases:
+    /// 1. **Search** — retrieve candidate dependencies via PPR-ranked fusion.
+    /// 2. **AST Prune** — low-rank nodes get collapsed to signatures only.
+    /// 3. **Post-process** — alias long identifiers, evacuate whitespace,
+    ///    monomorphize unused impl methods, and sort deterministically.
+    /// 4. **Pack** — greedily fill the token budget.
     pub async fn get_compressed_dependencies(
         &self,
         payload: &CursorPayload,
@@ -176,9 +190,9 @@ impl ContextTracker {
             .search_with_context(query, candidate_count, cursor_node)
             .await;
 
-        let mut compressed = Vec::new();
-        let mut used_tokens = 0usize;
-        for result in results {
+        // Phase 1: Collect all candidate chunks with their PPR scores.
+        let mut candidates: Vec<(usize, f64, String)> = Vec::new();
+        for result in &results {
             if Some(result.node_id) == cursor_node {
                 continue;
             }
@@ -186,12 +200,36 @@ impl ContextTracker {
                 continue;
             };
             let prompt_text = chunk.prompt_text();
-            let tokens = estimate_tokens(&prompt_text);
-            if used_tokens + tokens > self.config.dependency_token_budget {
+            let pagerank = self
+                .asg
+                .get_node(result.node_id)
+                .map(|n| n.pagerank)
+                .unwrap_or(0.0);
+            candidates.push((result.node_id, pagerank, prompt_text));
+        }
+
+        // Phase 2: AST signature pruning — low-rank dependencies are
+        // collapsed to declarations only, saving ~80% tokens.
+        let pruned = crate::ast::prune_batch(candidates, &self.config.prune);
+
+        // Phase 3: Post-processing pipeline — alias, whitespace-evacuate,
+        // monomorphize, and deterministically sort.
+        let processed = crate::ast::postprocess(
+            pruned,
+            &self.config.postprocess,
+            &self.asg,
+            cursor_node,
+        );
+
+        // Phase 4: Pack greedily under the token budget.
+        let mut compressed = Vec::new();
+        let mut used_tokens = 0usize;
+        for dep in processed {
+            if used_tokens + dep.tokens > self.config.dependency_token_budget {
                 continue;
             }
-            used_tokens += tokens;
-            compressed.push(prompt_text);
+            used_tokens += dep.tokens;
+            compressed.push(dep.text);
             if compressed.len() >= self.config.max_dependencies {
                 break;
             }

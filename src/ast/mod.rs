@@ -19,11 +19,15 @@
 
 pub mod chunker;
 pub mod merkle;
+pub mod postprocess;
+pub mod prune;
 pub mod trigram;
 pub mod vector;
 
 pub use chunker::{AstChunk, AstChunker, ChunkKind};
 pub use merkle::{DiffResult, MerkleTree};
+pub use postprocess::{postprocess, PostprocessConfig, ProcessedDep};
+pub use prune::{prune_batch, prune_to_signatures, PruneConfig};
 pub use trigram::{TrigramHit, TrigramIndex};
 pub use vector::{MemoryVectorStore, ObfuscatedChunk, Obfuscator, SyncReport, VectorStore, VectorSync};
 

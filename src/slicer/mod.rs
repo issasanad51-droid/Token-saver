@@ -28,7 +28,7 @@ impl SkeletonSlicer {
     /// Produce a skeleton of `source`. The function whose byte range overlaps
     /// `active_range` (if any) is kept fully intact; every other function body
     /// is replaced with `// [body hidden to save tokens]`.
-    pub fn skeleton(&self, source: &str, active_range: Option<(usize, usize)>) -> String {
+    pub fn skeleton(&mut self, source: &str, active_range: Option<(usize, usize)>) -> String {
         let tree = match self.parser.parse(source, None) {
             Some(t) => t,
             None => return source.to_string(),
@@ -65,7 +65,7 @@ impl SkeletonSlicer {
     }
 
     /// Count how many bodies would be hidden.
-    pub fn hidden_body_count(&self, source: &str, active_range: Option<(usize, usize)>) -> usize {
+    pub fn hidden_body_count(&mut self, source: &str, active_range: Option<(usize, usize)>) -> usize {
         let tree = match self.parser.parse(source, None) {
             Some(t) => t,
             None => return 0,
@@ -111,9 +111,12 @@ mod tests {
     #[test]
     fn skeleton_hides_other_bodies_keeps_active() {
         let src = "fn a() {\n    let x = 1;\n}\n\nfn b() {\n    let y = 2;\n}\n";
-        let slicer = SkeletonSlicer::new().unwrap();
-        // Active range covers fn b's body.
-        let active = Some((src.find("let y").unwrap(), src.find("let y").unwrap() + 10));
+        let mut slicer = SkeletonSlicer::new().unwrap();
+        // Active range must cover the entire body of fn b (from '{' to '}').
+        let fn_b_start = src.find("fn b").unwrap();
+        let body_start = fn_b_start + src[fn_b_start..].find('{').unwrap();
+        let body_end = fn_b_start + src[fn_b_start..].rfind('}').unwrap() + 1;
+        let active = Some((body_start, body_end));
         let skeleton = slicer.skeleton(src, active);
         assert!(skeleton.contains("fn a()"));
         assert!(skeleton.contains("// [body hidden to save tokens]"));
@@ -124,7 +127,7 @@ mod tests {
     #[test]
     fn skeleton_keeps_all_when_no_functions() {
         let src = "// just a comment\n";
-        let slicer = SkeletonSlicer::new().unwrap();
+        let mut slicer = SkeletonSlicer::new().unwrap();
         assert_eq!(slicer.skeleton(src, None), src);
     }
 }

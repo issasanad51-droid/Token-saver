@@ -32,6 +32,10 @@ pub enum ChunkKind {
     Static,
     Macro,
     Module,
+    EnumVariant,
+    Union,
+    UnionVariant,
+    TypeAlias,
     /// A recognized item we still want standalone (e.g. a top-level statement
     /// block that is not one of the above).
     Other,
@@ -51,6 +55,10 @@ impl ChunkKind {
             "static_item" => Some(ChunkKind::Static),
             "macro_definition" => Some(ChunkKind::Macro),
             "mod_item" => Some(ChunkKind::Module),
+            "enum_variant" => Some(ChunkKind::EnumVariant),
+            "union_item" => Some(ChunkKind::Union),
+            "union_variant" => Some(ChunkKind::UnionVariant),
+            "type_alias" => Some(ChunkKind::TypeAlias),
             _ => None,
         }
     }
@@ -68,8 +76,25 @@ impl ChunkKind {
             ChunkKind::Static => "static",
             ChunkKind::Macro => "macro",
             ChunkKind::Module => "mod",
+            ChunkKind::EnumVariant => "enum_variant",
+            ChunkKind::Union => "union",
+            ChunkKind::UnionVariant => "union_variant",
+            ChunkKind::TypeAlias => "type_alias",
             ChunkKind::Other => "other",
         }
+    }
+
+    /// Returns true if this chunk kind represents a definition that can have
+    /// children (i.e. scope-creating items).
+    pub fn is_scope_creating(&self) -> bool {
+        matches!(
+            self,
+            ChunkKind::Module
+                | ChunkKind::Impl
+                | ChunkKind::Enum
+                | ChunkKind::Struct
+                | ChunkKind::Union
+        )
     }
 }
 
@@ -113,6 +138,15 @@ impl AstChunk {
     /// living in different scopes of one file — e.g. `impl A { fn new }` vs
     /// `impl B { fn new }` — which the Merkle/trigram/vector layers all rely on
     /// as their stable key.
+    ///
+    /// The scope path uses the `is_scope_creating` property to determine which
+    /// ancestor kinds should be included in the namespace, preventing overly
+    /// deep nesting for items that don't create new scopes (e.g. enum variants,
+    /// fields).
+    ///
+    /// Items that are NOT scope-creating but have purely numeric scope segments
+    /// (like `block::2` from multiple impl blocks) are excluded to keep ids
+    /// concise.
     pub fn make_id_ns(
         file_path: &Path,
         scope: &[String],
@@ -120,9 +154,16 @@ impl AstChunk {
         name: &str,
     ) -> String {
         let mut id = file_path.to_string_lossy().replace('\\', "/");
+        // Include scope segments only for scope-creating kinds; for non-scope
+        // kinds skip pure-numeric segments (impl block numbers) to avoid
+        // unnecessary depth like `::impl::block::2::fn::new`.
+        let include_scope = kind.is_scope_creating();
         for seg in scope {
-            id.push_str("::");
-            id.push_str(seg);
+            let is_pure_numeric = seg.chars().all(|c| c.is_ascii_digit());
+            if include_scope || !is_pure_numeric {
+                id.push_str("::");
+                id.push_str(seg);
+            }
         }
         id.push_str("::");
         id.push_str(kind.as_str());
@@ -293,6 +334,34 @@ fn extract_name(node: TsNode, source: &str) -> Option<String> {
             Some(t) => Some(format!("{t}_for_{self_type}")),
             None => Some(format!("for_{self_type}")),
         };
+    }
+    // Enum variants
+    if node.kind() == "enum_variant" {
+        return node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(str::to_string);
+    }
+    // Union variants
+    if node.kind() == "union_variant" {
+        return node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(str::to_string);
+    }
+    // Type aliases
+    if node.kind() == "type_alias" {
+        return node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(str::to_string);
+    }
+    // Struct fields
+    if node.kind() == "field" {
+        return node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(str::to_string);
     }
     None
 }

@@ -39,7 +39,7 @@ impl BridgeMapper {
         // SQL inside macro invocations: query!("..."), sqlx::query!("..."),
         // plus raw strings (r#"..."#) that begin with a SQL keyword.
         let sql_re = Regex::new(
-            r#"(?i)(?:query!|query_as!|sqlx::query!|sqlx::query_as!)\s*\(\s*"([^"]*)"|r#?"((?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\s[^"]*)"#?"#,
+            r##"(?i)(?:query!|query_as!|sqlx::query!|sqlx::query_as!)\s*\(\s*"([^"]*)"|r#?"((?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\s[^"]*)"#?"##,
         )
         .expect("valid sql bridge regex");
         // API endpoint references: "/api/...", "http(s)://host/api/...".

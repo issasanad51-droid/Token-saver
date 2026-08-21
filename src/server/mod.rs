@@ -637,6 +637,7 @@ pub async fn stats_handler(State(state): State<ServerState>) -> impl IntoRespons
             crate::asg::EdgeKind::Implements => "implements",
             crate::asg::EdgeKind::FieldOf => "field_of",
             crate::asg::EdgeKind::VariantOf => "variant_of",
+            crate::asg::EdgeKind::Bridge => "bridge",
         };
         *edge_kinds.entry(label.to_string()).or_default() += 1;
     }

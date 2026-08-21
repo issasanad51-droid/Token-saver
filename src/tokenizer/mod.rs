@@ -210,10 +210,10 @@ impl SymbolFolder {
         }
 
         FoldedText {
+            folded_bytes: text.len(),
             text,
             decoder,
             original_bytes: source.len(),
-            folded_bytes: text.len(),
         }
     }
 }

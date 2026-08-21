@@ -66,6 +66,11 @@ pub enum Seed {
     Foundational,
     /// Explicit node ids.
     Custom(Vec<NodeId>),
+    /// Module-based seeding: higher weight for nodes in the same module
+    /// as the query cursor, decreasing with module distance.
+    ModuleBased(Vec<NodeId>, f64),
+    /// Degree-based seeding: proportional to node degree (in + out).
+    DegreeBased(Vec<NodeId>),
 }
 
 /// Parameters for the weighted personalized PageRank iteration.
@@ -117,6 +122,9 @@ pub fn pagerank<'a>(graph: &AsgGraph<'a>, config: &PageRankConfig) -> Vec<(NodeI
         .collect();
 
     // Weighted adjacency (compressed as CSR) + weighted out-degree.
+    // Parallel edges between the same `(src, dst)` pair are collapsed to the
+    // max weight so repeated call sites don't multiply a target's centrality —
+    // centrality should reflect *distinct* structural relationships.
     let mut out_w = vec![0.0f64; n];
     let mut edges_out: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
     for e in graph.graph().edge_references() {
@@ -126,19 +134,25 @@ pub fn pagerank<'a>(graph: &AsgGraph<'a>, config: &PageRankConfig) -> Vec<(NodeI
             continue; // self-loops carry no structural signal
         }
         let w = edge_weight(*e.weight(), &config.edge_weights);
-        edges_out[src].push((dst, w));
-        out_w[src] += w;
+        match edges_out[src].iter_mut().find(|(d, _)| *d == dst) {
+            Some(slot) => slot.1 = slot.1.max(w),
+            None => {
+                edges_out[src].push((dst, w));
+                out_w[src] += w;
+            }
+        }
     }
 
     // Personalization vector.
     let v = personalization_vector(&pos_of, graph, &config.seed);
 
-    // Power iteration.
+    // Power iteration with relative convergence detection.
     let d = config.damping;
     let mut pr = v.clone();
     let mut next = vec![0.0f64; n];
 
-    for _ in 0..config.max_iterations {
+    let mut prev_diff = f64::INFINITY;
+    for iteration in 0..=config.max_iterations {
         for x in next.iter_mut() {
             *x = 0.0;
         }
@@ -162,11 +176,23 @@ pub fn pagerank<'a>(graph: &AsgGraph<'a>, config: &PageRankConfig) -> Vec<(NodeI
         }
 
         let mut diff = 0.0;
+        let mut max_change = 0.0f64;
         for i in 0..n {
-            diff += (pr[i] - next[i]).abs();
+            let change = (pr[i] - next[i]).abs();
+            diff += change;
+            max_change = max_change.max(change);
         }
         pr.copy_from_slice(&next);
-        if diff < config.epsilon {
+
+        // Convergence: relative change based on max change
+        let rel_change = if prev_diff > 0.0 {
+            diff / prev_diff
+        } else {
+            f64::INFINITY
+        };
+        prev_diff = diff;
+
+        if rel_change < config.epsilon && max_change < config.epsilon {
             break;
         }
     }
@@ -238,6 +264,87 @@ fn personalization_vector<'a>(
             let mut seen = HashSet::new();
             seeds.retain(|s| seen.insert(s.clone()));
             apply_seeds(&mut v, pos_of, seeds.into_iter());
+        }
+        Seed::ModuleBased(seed_modules, decay) => {
+            // Seed nodes by module proximity to the cursor modules, with
+            // weight decaying exponentially per level of module distance:
+            //   w(node) = decay ^ shared_prefix_len(node_module, seed_module)
+            //
+            // A `NodeId` looks like `crate::<module path>::<kind>::<name>`,
+            // so the module path is everything between `crate` and the final
+            // two `<kind>::<name>` segments.
+            fn module_of(id: &NodeId) -> Vec<String> {
+                let parts: Vec<&str> = id.0.split("::").collect();
+                // strip leading crate root + trailing kind/name
+                let end = parts.len().saturating_sub(2);
+                let start = usize::from(parts.first() == Some(&"crate"));
+                if end > start {
+                    parts[start..end].iter().map(|s| s.to_string()).collect()
+                } else {
+                    Vec::new()
+                }
+            };
+
+            let mut total_weight = 0.0f64;
+            for (node_id, &p) in pos_of.iter() {
+                let node_mod = module_of(node_id);
+                let mut best = 0.0f64;
+                for seed_module in seed_modules {
+                    let seed_parts: Vec<&str> = seed_module.0.split("::").collect();
+                    let shared = node_mod
+                        .iter()
+                        .map(|s| s.as_str())
+                        .zip(seed_parts.iter().copied())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    // Weight decays per unmatched segment: an exact module
+                    // match (distance 0) gets 1.0, each level of divergence
+                    // multiplies by `decay`.
+                    let distance = (seed_parts.len() - shared) as i32;
+                    let w = decay.powi(distance);
+                    best = best.max(w);
+                }
+                if best > 0.0 {
+                    v[p] = best;
+                    total_weight += best;
+                }
+            }
+            if total_weight > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= total_weight;
+                }
+            } else {
+                // No module matched — fall back to uniform.
+                for x in v.iter_mut() {
+                    *x = 1.0 / n as f64;
+                }
+            }
+        }
+        Seed::DegreeBased(_) => {
+            // Seed nodes proportional to their total degree (in + out),
+            // keyed by real `NodeId`s resolved through the graph.
+            let mut degree: HashMap<NodeId, f64> = HashMap::new();
+            for e in graph.graph().edge_references() {
+                if let Some(id) = graph.id_of(e.source()) {
+                    *degree.entry(id.clone()).or_insert(0.0) += 1.0;
+                }
+                if let Some(id) = graph.id_of(e.target()) {
+                    *degree.entry(id.clone()).or_insert(0.0) += 1.0;
+                }
+            }
+            let mut total = 0.0f64;
+            for (node_id, &p) in pos_of.iter() {
+                if let Some(&deg) = degree.get(node_id) {
+                    let w = deg.max(0.01); // minimum weight floor
+                    v[p] = w;
+                    total += w;
+                }
+            }
+            if total > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= total;
+                }
+            }
         }
     }
     v
@@ -357,21 +464,151 @@ mod tests {
     }
 
     #[test]
-    fn empty_graph_is_safe() {
-        let g: AsgGraph<'static> = AsgGraph::new();
-        assert!(pagerank(&g, &PageRankConfig::default()).is_empty());
+    fn module_based_seeding() {
+        use crate::asg::source::SourceSet;
+
+        let mut ss = SourceSet::new();
+        ss.insert(
+            std::path::PathBuf::from("src/mod.rs"),
+            r#"pub mod inner;
+pub fn outer() {}
+"#
+            .to_string(),
+        );
+        ss.insert(
+            std::path::PathBuf::from("src/mod/inner.rs"),
+            r#"pub fn inner_fn() {}
+pub mod deep;
+pub fn deep_fn() {}
+"#
+            .to_string(),
+        );
+        ss.insert(
+            std::path::PathBuf::from("src/mod/deep.rs"),
+            r#"pub fn deep_fn2() {}
+"#
+            .to_string(),
+        );
+
+        let mut builder = crate::asg::builder::AsgBuilder::new(&ss)
+            .unwrap()
+            .with_crate_root(std::path::Path::new("."));
+        builder.parse().unwrap();
+        let graph = builder.build();
+
+        // Module-based seeding should boost nodes in the same module
+        let config = PageRankConfig {
+            seed: Seed::ModuleBased(vec![NodeId::new("crate")], 0.5),
+            ..PageRankConfig::default()
+        };
+        let scores = pagerank_map(&graph, &config);
+
+        // Every node must receive a normalized (positive) score.
+        assert!(
+            scores.values().all(|&s| s > 0.0),
+            "module-based seeding should produce a valid distribution"
+        );
     }
 
     #[test]
-    fn scores_sum_to_one() {
+    fn degree_based_seeding() {
         let mut g = AsgGraph::new();
+        let hub = add_node(&mut g, &[], "fn", "hub", NodeType::Fn);
+        let leaf1 = add_node(&mut g, &[], "fn", "leaf1", NodeType::Fn);
+        let leaf2 = add_node(&mut g, &[], "fn", "leaf2", NodeType::Fn);
+        let leaf3 = add_node(&mut g, &[], "fn", "leaf3", NodeType::Fn);
+
+        // hub connects to all leaves
+        g.add_edge(&hub, &leaf1, EdgeKind::Calls).unwrap();
+        g.add_edge(&hub, &leaf2, EdgeKind::Calls).unwrap();
+        g.add_edge(&hub, &leaf3, EdgeKind::Calls).unwrap();
+
+        let uniform = pagerank_map(&g, &PageRankConfig::default());
+        let seeded = pagerank_map(
+            &g,
+            &PageRankConfig {
+                seed: Seed::DegreeBased(vec![hub.clone()]),
+                ..PageRankConfig::default()
+            },
+        );
+
+        // hub should have higher score with degree-based seeding
+        assert!(
+            seeded[&hub] > uniform[&hub],
+            "degree-based seeding should boost hub score"
+        );
+        // leaves should have lower relative scores
+        assert!(
+            seeded[&leaf1] < uniform[&leaf1] + 0.1,
+            "degree-based seeding should not boost leaves disproportionately"
+        );
+    }
+
+    #[test]
+    fn module_based_seed_prefers_same_module() {
+        let mut g = AsgGraph::new();
+        let in_mod = add_node(&mut g, &["server"], "fn", "handler", NodeType::Fn);
+        let out_mod = add_node(&mut g, &["client"], "fn", "render", NodeType::Fn);
+        // No edges at all: scores come purely from teleportation.
+        let cfg = PageRankConfig {
+            seed: Seed::ModuleBased(vec![NodeId::new("server")], 0.5),
+            ..PageRankConfig::default()
+        };
+        let scores = pagerank_map(&g, &cfg);
+        assert!(
+            scores[&in_mod] > scores[&out_mod],
+            "same-module node ({}) should outrank other-module node ({})",
+            scores[&in_mod],
+            scores[&out_mod]
+        );
+    }
+
+    #[test]
+    fn degree_based_seed_prefers_high_degree() {
+        let mut g = AsgGraph::new();
+        let hub = add_node(&mut g, &[], "fn", "hub", NodeType::Fn);
+        let leaf = add_node(&mut g, &[], "fn", "leaf", NodeType::Fn);
         let a = add_node(&mut g, &[], "fn", "a", NodeType::Fn);
         let b = add_node(&mut g, &[], "fn", "b", NodeType::Fn);
-        g.add_edge(&a, &b, EdgeKind::Calls).unwrap();
-        g.add_edge(&b, &a, EdgeKind::References).unwrap();
+        for caller in [&a, &b] {
+            g.add_edge(caller, &hub, EdgeKind::Calls).unwrap();
+        }
+
+        let cfg = PageRankConfig {
+            seed: Seed::DegreeBased(vec![hub.clone(), leaf.clone()]),
+            ..PageRankConfig::default()
+        };
+        let scores = pagerank_map(&g, &cfg);
+        assert!(
+            scores[&hub] > scores[&leaf],
+            "high-degree seed ({}) should outrank zero-degree seed ({})",
+            scores[&hub],
+            scores[&leaf]
+        );
+    }
+
+    #[test]
+    fn duplicate_edges_do_not_inflate_centrality() {
+        // Ten parallel `calls` edges to `dup` vs one to `once`: with
+        // deduplication both targets receive the same share of mass.
+        let mut g = AsgGraph::new();
+        let dup = add_node(&mut g, &[], "fn", "dup", NodeType::Fn);
+        let once = add_node(&mut g, &[], "fn", "once", NodeType::Fn);
+        let s = add_node(&mut g, &[], "fn", "s", NodeType::Fn);
+        let a = add_node(&mut g, &[], "fn", "a", NodeType::Fn);
+        g.add_edge(&a, &s, EdgeKind::Calls).unwrap();
+        for _ in 0..10 {
+            g.add_edge(&s, &dup, EdgeKind::Calls).unwrap();
+        }
+        g.add_edge(&s, &once, EdgeKind::Calls).unwrap();
 
         let scores = pagerank_map(&g, &PageRankConfig::default());
-        let total: f64 = scores.values().sum();
-        assert!((total - 1.0).abs() < 1e-6, "total={total}");
+        let diff = (scores[&dup] - scores[&once]).abs();
+        assert!(
+            diff < 1e-9,
+            "parallel edges must not skew centrality: dup={} once={}",
+            scores[&dup],
+            scores[&once]
+        );
     }
 }

@@ -393,6 +393,29 @@ impl<'a> AsgBuilder<'a> {
         }
     }
 
+    /// Resolve a name: try module-qualified keys (walking up the module chain),
+    /// then fall back to a global bare-name match.
+    fn resolve_name(&self, name: &str, module: &[String]) -> Option<NodeId> {
+        let normalized = normalize_symbol(name);
+        for i in (0..=module.len()).rev() {
+            let prefix = module[..i].join("::");
+            let key = if prefix.is_empty() {
+                normalized.clone()
+            } else {
+                format!("{prefix}::{normalized}")
+            };
+            if let Some(id) = self.symbols.get(&key) {
+                return Some(id.clone());
+            }
+        }
+        self.symbols.get(&normalized).cloned().or_else(|| {
+            normalized
+                .rsplit("::")
+                .next()
+                .and_then(|bare| self.symbols.get(bare).cloned())
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Deferred edge collection
     // -----------------------------------------------------------------------
@@ -487,29 +510,6 @@ impl<'a> AsgBuilder<'a> {
             }
         }
     }
-
-    /// Resolve a name: try module-qualified keys (walking up the module chain),
-    /// then fall back to a global bare-name match.
-    fn resolve_name(&self, name: &str, module: &[String]) -> Option<NodeId> {
-        let normalized = normalize_symbol(name);
-        for i in (0..=module.len()).rev() {
-            let prefix = module[..i].join("::");
-            let key = if prefix.is_empty() {
-                normalized.clone()
-            } else {
-                format!("{prefix}::{normalized}")
-            };
-            if let Some(id) = self.symbols.get(&key) {
-                return Some(id.clone());
-            }
-        }
-        self.symbols.get(&normalized).cloned().or_else(|| {
-            normalized
-                .rsplit("::")
-                .next()
-                .and_then(|bare| self.symbols.get(bare).cloned())
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -538,53 +538,60 @@ fn field_text(node: TsNode, field: &str, source: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Extract the callee name from a call expression's `function` child.
+///
+/// Handles plain identifiers (`foo()`), path calls (`a::b::f()`), and method
+/// calls (`x.y()` → `y`). Returns the raw source text of the callee.
+fn callee_name(node: TsNode, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "scoped_identifier" => {
+            node.utf8_text(source.as_bytes())
+                .ok()
+                .map(|t| {
+                    // For scoped paths keep only the final segment (`a::b::f` -> `f`).
+                    t.rsplit("::").next().unwrap_or(t).to_string()
+                })
+        }
+        "field_expression" => node
+            .child_by_field_name("field")
+            .and_then(|f| f.utf8_text(source.as_bytes()).ok())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
 /// Return the self type encoded in an impl tracker such as
 /// `crate::state::impl::for_AppState` or `...::impl::Display_for_AppState`.
 fn impl_owner(parent: &str) -> Option<String> {
     let marker = "::impl::";
-    let label = parent
-        .rsplit_once(marker)?
-        .1
+    let (before_marker, after_marker) = parent.rsplit_once(marker)?;
+    let self_type = before_marker
+        .rsplit("::")
+        .next()?
+        .trim()
+        .to_string();
+    let after_block = after_marker
         .split("::block::")
-        .next()
-        .unwrap_or_default();
-    let owner = label
-        .rsplit_once("_for_")
-        .map(|(_, owner)| owner)
-        .or_else(|| label.strip_prefix("for_"))?;
-    Some(normalize_symbol(owner))
+        .next()?
+        .trim()
+        .to_string();
+    // The owner is the self type minus any generic arguments, normalized.
+    Some(normalize_symbol(&self_type).strip_prefix(&normalize_symbol(&after_block))?.to_string())
 }
 
 /// Strip Rust path prefixes/generic arguments down to the stable symbol form
-/// used by the lightweight resolver.
+/// used by the lightweight resolver. Normalize a symbol name by stripping
+/// generics, crate prefixes, and whitespace so symbol resolution is robust
+/// across naming conventions.
 fn normalize_symbol(name: &str) -> String {
     let no_generics = name.split('<').next().unwrap_or(name).trim();
     no_generics
         .trim_start_matches("crate::")
         .trim_start_matches("self::")
         .trim_start_matches("super::")
-        .replace(' ', "")
-}
-
-/// Extract the callable name from a call expression's `function` field.
-/// Handles `f()`, `a::b::f()`, `x.f()`, `f::<T>()`.
-fn callee_name(callee: TsNode, source: &str) -> Option<String> {
-    match callee.kind() {
-        "identifier" => callee.utf8_text(source.as_bytes()).ok().map(str::to_string),
-        "field_expression" => callee
-            .child_by_field_name("field")
-            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-            .map(str::to_string),
-        "scoped_identifier" => callee
-            .utf8_text(source.as_bytes())
-            .ok()
-            .map(normalize_symbol),
-        "generic_function" => callee
-            .child_by_field_name("function")
-            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-            .map(normalize_symbol),
-        _ => None,
-    }
+        .trim_start_matches("std::")
+        .split_whitespace()
+        .collect::<String>()
 }
 
 // ---------------------------------------------------------------------------
