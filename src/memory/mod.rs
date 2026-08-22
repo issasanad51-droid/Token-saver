@@ -181,7 +181,7 @@ impl MemoryStore {
         self.memories
             .iter()
             .filter(|entry| {
-                namespace.map_or(true, |ns| entry.value().namespace.as_deref() == Some(ns))
+                namespace.is_none_or(|ns| entry.value().namespace.as_deref() == Some(ns))
             })
             .map(|entry| entry.value().clone())
             .collect()

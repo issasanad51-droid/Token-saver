@@ -239,7 +239,7 @@ impl AstChunker {
         });
         for entry in walker.filter_map(Result::ok) {
             let path = entry.path();
-            if entry.file_type().is_file() && path.extension().map_or(false, |e| e == "rs") {
+            if entry.file_type().is_file() && path.extension().is_some_and(|e| e == "rs") {
                 let source = std::fs::read_to_string(path)?;
                 chunks.extend(self.chunk_source(path, &source));
             }

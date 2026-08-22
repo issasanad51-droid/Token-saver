@@ -147,7 +147,7 @@ fn collect_top_level_items<'a>(
             "struct_item" | "enum_item" | "type_item" | "const_item"
             | "static_item" | "macro_definition" | "mod_item" | "use_declaration"
             | "extern_crate_declaration" | "attribute_item" | "function_signature_item" => {
-                out.push_str(&child
+                out.push_str(child
                     .utf8_text(source.as_bytes())
                     .unwrap_or_default());
                 out.push('\n');
@@ -180,7 +180,7 @@ fn emit_signature(node: TsNode, source: &str, out: &mut String, _is_top: bool) {
     } else {
         // No body (shouldn't happen for `function_item`, but be safe).
         out.push_str(
-            &node
+            node
                 .utf8_text(source.as_bytes())
                 .unwrap_or_default(),
         );
@@ -197,7 +197,7 @@ fn emit_impl_header(node: TsNode, source: &str, out: &mut String) {
         out.push_str(sig);
     } else {
         out.push_str(
-            &node
+            node
                 .utf8_text(source.as_bytes())
                 .unwrap_or_default(),
         );
@@ -213,7 +213,7 @@ fn emit_trait_header(node: TsNode, source: &str, out: &mut String) {
         out.push_str(sig);
     } else {
         out.push_str(
-            &node
+            node
                 .utf8_text(source.as_bytes())
                 .unwrap_or_default(),
         );

@@ -265,7 +265,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> anyhow::Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(anyhow::anyhow!("invalid hex length"));
     }
     (0..s.len())
@@ -319,19 +319,19 @@ mod tests {
         let mut sync = VectorSync::new(&key, store).unwrap();
 
         let c = chunk("fn_a", "pub fn a() {}");
-        let r1 = sync.sync(&[c.clone()]).unwrap();
+        let r1 = sync.sync(std::slice::from_ref(&c)).unwrap();
         assert_eq!(r1.upserted, 1);
         let remote_id = sync.store.data.keys().next().unwrap();
         assert!(remote_id.starts_with("c_"));
         assert!(!remote_id.contains("fn_a"));
 
         // Re-sync identical content → skipped.
-        let r2 = sync.sync(&[c.clone()]).unwrap();
+        let r2 = sync.sync(std::slice::from_ref(&c)).unwrap();
         assert_eq!(r2.upserted, 0);
         assert_eq!(r2.skipped, 1);
 
         // Delete it.
-        sync.delete(&[c.id.clone()]).unwrap();
+        sync.delete(std::slice::from_ref(&c.id)).unwrap();
         assert!(sync.synced.is_empty());
     }
 }

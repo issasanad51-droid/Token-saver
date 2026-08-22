@@ -571,13 +571,13 @@ impl SearchEngine {
         .map(|fused| {
             let mut scores = HashMap::new();
             let mut contributions = HashMap::new();
-            for index in 0..STREAM_NAMES.len() {
+            for (index, stream_name) in STREAM_NAMES.iter().enumerate() {
                 if let Some(score) = fused.raw_scores[index] {
-                    scores.insert(STREAM_NAMES[index], score);
+                    scores.insert(*stream_name, score);
                 }
                 let contribution = fused.rrf_contributions[index];
                 if contribution > 0.0 {
-                    contributions.insert(STREAM_NAMES[index], contribution);
+                    contributions.insert(*stream_name, contribution);
                 }
             }
             MergedResult {

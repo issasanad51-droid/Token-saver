@@ -128,8 +128,8 @@ pub fn pagerank<'a>(graph: &AsgGraph<'a>, config: &PageRankConfig) -> Vec<(NodeI
     let mut out_w = vec![0.0f64; n];
     let mut edges_out: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
     for e in graph.graph().edge_references() {
-        let src = e.source().index() as usize;
-        let dst = e.target().index() as usize;
+        let src = e.source().index();
+        let dst = e.target().index();
         if src == dst {
             continue; // self-loops carry no structural signal
         }
@@ -152,7 +152,7 @@ pub fn pagerank<'a>(graph: &AsgGraph<'a>, config: &PageRankConfig) -> Vec<(NodeI
     let mut next = vec![0.0f64; n];
 
     let mut prev_diff = f64::INFINITY;
-    for iteration in 0..=config.max_iterations {
+    for _iteration in 0..=config.max_iterations {
         for x in next.iter_mut() {
             *x = 0.0;
         }
@@ -283,7 +283,7 @@ fn personalization_vector<'a>(
                 } else {
                     Vec::new()
                 }
-            };
+            }
 
             let mut total_weight = 0.0f64;
             for (node_id, &p) in pos_of.iter() {

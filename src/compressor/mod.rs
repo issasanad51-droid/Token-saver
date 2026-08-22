@@ -37,7 +37,7 @@ impl CompressedChunk {
             return self.compressed_source.clone();
         }
         let mut aliases: Vec<(&String, &String)> = self.dictionary.iter().collect();
-        aliases.sort_by(|(_, left_token), (_, right_token)| left_token.cmp(right_token));
+        aliases.sort_by_key(|(_, left_token)| *left_token);
         let legend = aliases
             .into_iter()
             .map(|(original, token)| format!("{token}={original}"))
@@ -85,7 +85,7 @@ impl ChunkRegistry {
         // Replace longest tokens first (`$aa` before `$a`) so one compact alias
         // can never corrupt another during hydration.
         let mut aliases: Vec<(&String, &String)> = chunk.reverse_dictionary.iter().collect();
-        aliases.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+        aliases.sort_by_key(|(token, _)| std::cmp::Reverse(token.len()));
         for (token, original) in aliases {
             result = result.replace(token, original);
         }

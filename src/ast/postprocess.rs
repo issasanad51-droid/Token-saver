@@ -339,11 +339,10 @@ fn strip_method_prefix(s: &str) -> Option<&str> {
         rest = rest.trim_start();
         if rest.starts_with('(') {
             // Consume `pub(crate)` / `pub(super)` / `pub(in path)`.
-            if let Some(end) = rest.find(')') {
+            {
+                let end = rest.find(')')?;
                 rest = &rest[end + 1..];
                 rest = rest.trim_start();
-            } else {
-                return None;
             }
         }
     }
@@ -413,10 +412,8 @@ fn aggressive_alias(source: &str, min_length: usize) -> String {
     candidates.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
 
     let mut alias_map: HashMap<String, String> = HashMap::with_capacity(candidates.len());
-    let mut counter: u32 = 0;
-    for ident in &candidates {
-        let alias = encode_alias(counter);
-        counter += 1;
+    for (counter, ident) in candidates.iter().enumerate() {
+        let alias = encode_alias(counter as u32);
         alias_map.insert(ident.clone(), alias);
     }
 
@@ -1006,7 +1003,7 @@ mod tests {
 
     #[test]
     fn deps_sort_by_module_path() {
-        let mut deps = vec![
+        let mut deps = [
             ProcessedDep { module_path: "crate::z".into(), text: "z".into(), tokens: 1, was_transformed: false },
             ProcessedDep { module_path: "crate::a".into(), text: "a".into(), tokens: 1, was_transformed: false },
             ProcessedDep { module_path: "crate::m".into(), text: "m".into(), tokens: 1, was_transformed: false },

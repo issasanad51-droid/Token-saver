@@ -128,7 +128,7 @@ fn hash_pair(left: &str, right: &str) -> String {
     let mut hasher = Sha256::new();
     // Encode the length of left before its bytes so the boundary is
     // unambiguous — no allocation, no format!().
-    hasher.update(&(left.len() as u64).to_le_bytes());
+    hasher.update((left.len() as u64).to_le_bytes());
     hasher.update(left.as_bytes());
     hasher.update(right.as_bytes());
     format!("{:x}", hasher.finalize())

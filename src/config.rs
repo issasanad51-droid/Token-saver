@@ -129,8 +129,10 @@ mod tests {
 
     #[test]
     fn resolve_db_path_uses_explicit() {
-        let mut config = TokenSaverConfig::default();
-        config.db_path = Some(PathBuf::from("/custom/path.db"));
+        let config = TokenSaverConfig {
+            db_path: Some(PathBuf::from("/custom/path.db")),
+            ..TokenSaverConfig::default()
+        };
         assert_eq!(
             config.resolve_db_path(),
             PathBuf::from("/custom/path.db")

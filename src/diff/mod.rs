@@ -93,8 +93,7 @@ impl DiffGenerator {
                 if l.starts_with("@@") {
                     break;
                 }
-                if l.starts_with(' ') {
-                    let content = &l[1..];
+                if let Some(content) = l.strip_prefix(' ') {
                     if old_pos >= original_lines.len() || original_lines[old_pos] != content {
                         return Err(DiffError::ContextMismatch {
                             line: old_pos + 1,
@@ -104,8 +103,7 @@ impl DiffGenerator {
                     result.push(content.to_string());
                     old_pos += 1;
                     idx += 1;
-                } else if l.starts_with('-') {
-                    let content = &l[1..];
+                } else if let Some(content) = l.strip_prefix('-') {
                     if old_pos >= original_lines.len() || original_lines[old_pos] != content {
                         return Err(DiffError::ContextMismatch {
                             line: old_pos + 1,
@@ -114,8 +112,8 @@ impl DiffGenerator {
                     }
                     old_pos += 1;
                     idx += 1;
-                } else if l.starts_with('+') {
-                    result.push(l[1..].to_string());
+                } else if let Some(content) = l.strip_prefix('+') {
+                    result.push(content.to_string());
                     idx += 1;
                 } else {
                     return Err(DiffError::Malformed(format!("unexpected line: {l}")));
@@ -200,10 +198,8 @@ fn group_hunks(ops: &[(Op, usize, usize)], context: usize) -> Vec<Hunk> {
         let change_end = j;
         let start = change_start.saturating_sub(context);
         let end = (change_end + context).min(n);
-        let (old_start, new_start) = match ops[start] {
-            (_, oi, bi) => (oi + 1, bi + 1),
-        };
-        hunks.push(Hunk {
+        let (_, oi, bi) = ops[start];
+        let (old_start, new_start) = (oi + 1, bi + 1);        hunks.push(Hunk {
             old_start,
             new_start,
             ops: ops[start..end].to_vec(),

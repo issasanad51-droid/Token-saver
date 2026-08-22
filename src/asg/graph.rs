@@ -181,7 +181,7 @@ pub struct AsgGraphSnapshot<'a> {
 
 /// serde helper: `Cow<str>` has no inherent `is_empty` (it is `Deref`-provided
 /// from `str`), so expose a free function for `skip_serializing_if`.
-fn cow_is_empty(c: &Cow<'_, str>) -> bool {
+fn cow_is_empty<T: std::ops::Deref<Target = str>>(c: &T) -> bool {
     c.is_empty()
 }
 

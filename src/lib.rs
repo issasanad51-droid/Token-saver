@@ -10,6 +10,7 @@ pub mod tokenizer;
 pub mod tracker;
 pub mod config;
 pub mod server;
+pub mod terminal;
 pub mod memory;
 pub mod mcp;
 pub mod watcher;

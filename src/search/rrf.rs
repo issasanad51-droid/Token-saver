@@ -156,7 +156,10 @@ pub fn fuse<Id: Clone + Eq + Hash>(
     // The ordinal makes exact ties deterministic despite HashMap's randomized
     // iteration order.
     let mut next_ordinal = 0usize;
-    let mut acc: HashMap<Id, (f64, Vec<f64>, Vec<Option<f64>>, usize)> = HashMap::new();
+    /// Per-document fusion accumulator: (ordinal, raw scores, rrf
+    /// contributions, hit count).
+    type FusionAcc = (f64, Vec<f64>, Vec<Option<f64>>, usize);
+    let mut acc: HashMap<Id, FusionAcc> = HashMap::new();
 
     for (stream_index, stream) in streams.iter().enumerate() {
         let weight = ws[stream_index];

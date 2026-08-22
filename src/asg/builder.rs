@@ -50,6 +50,17 @@ struct PendingImpl {
 // Builder
 // ---------------------------------------------------------------------------
 
+/// Shared per-item parsing context threaded through the extraction walk.
+/// `'a` is the `SourceSet` buffer lifetime (bodies borrow from it); `'b`
+/// covers the shorter-lived tree node, path, and module path.
+struct ItemCtx<'a, 'b> {
+    node: TsNode<'b>,
+    source: &'a str,
+    path: &'b Path,
+    module: &'b [String],
+    parent: Option<NodeId>,
+}
+
 /// Builds an `AsgGraph` from a `SourceSet`.
 pub struct AsgBuilder<'a> {
     parser: Parser,
@@ -169,7 +180,7 @@ impl<'a> AsgBuilder<'a> {
     /// impl body), creating a node for each recognized item.
     fn walk_items(
         &mut self,
-        container: TsNode,
+        container: TsNode<'_>,
         source: &'a str,
         path: &Path,
         module: &[String],
@@ -177,148 +188,118 @@ impl<'a> AsgBuilder<'a> {
     ) {
         for i in 0..container.named_child_count() {
             if let Some(child) = container.named_child(i) {
-                self.add_item(child, source, path, module, parent.clone());
+                let ctx = ItemCtx {
+                    node: child,
+                    source,
+                    path,
+                    module,
+                    parent: parent.clone(),
+                };
+                self.add_item(ctx);
             }
         }
     }
 
-    fn add_item(
-        &mut self,
-        node: TsNode,
-        source: &'a str,
-        path: &Path,
-        module: &[String],
-        parent: Option<NodeId>,
-    ) {
-        match node.kind() {
-            "function_item" => self.add_fn(node, source, path, module, parent),
-            "struct_item" => self.add_typed(node, source, path, module, parent, NodeType::Struct, "struct"),
-            "enum_item" => self.add_typed(node, source, path, module, parent, NodeType::Enum, "enum"),
-            "trait_item" => self.add_typed(node, source, path, module, parent, NodeType::Trait, "trait"),
-            "type_item" => self.add_typed(node, source, path, module, parent, NodeType::Type, "type"),
-            "const_item" => self.add_typed(node, source, path, module, parent, NodeType::Const, "const"),
-            "static_item" => self.add_typed(node, source, path, module, parent, NodeType::Static, "static"),
-            "macro_definition" => self.add_typed(node, source, path, module, parent, NodeType::Macro, "macro"),
-            "impl_item" => self.add_impl(node, source, path, module, parent),
-            "mod_item" => self.add_mod(node, source, path, module, parent),
+    fn add_item(&mut self, ctx: ItemCtx<'a, '_>) {
+        match ctx.node.kind() {
+            "function_item" => self.add_fn(ctx),
+            "struct_item" => self.add_typed(ctx, NodeType::Struct, "struct"),
+            "enum_item" => self.add_typed(ctx, NodeType::Enum, "enum"),
+            "trait_item" => self.add_typed(ctx, NodeType::Trait, "trait"),
+            "type_item" => self.add_typed(ctx, NodeType::Type, "type"),
+            "const_item" => self.add_typed(ctx, NodeType::Const, "const"),
+            "static_item" => self.add_typed(ctx, NodeType::Static, "static"),
+            "macro_definition" => self.add_typed(ctx, NodeType::Macro, "macro"),
+            "impl_item" => self.add_impl(ctx),
+            "mod_item" => self.add_mod(ctx),
             _ => {}
         }
     }
 
-    fn add_fn(
-        &mut self,
-        node: TsNode,
-        source: &'a str,
-        path: &Path,
-        module: &[String],
-        parent: Option<NodeId>,
-    ) {
-        let Some(name) = field_text(node, "name", source) else { return };
-        let id = self.scoped_id(module, parent.as_ref(), "fn", &name);
-        self.insert_node(node, source, path, module, parent, id, NodeType::Fn);
+    fn add_fn(&mut self, ctx: ItemCtx<'a, '_>) {
+        let Some(name) = field_text(ctx.node, "name", ctx.source) else { return };
+        let id = self.scoped_id(ctx.module, ctx.parent.as_ref(), "fn", &name);
+        self.insert_node(ctx, id, NodeType::Fn);
     }
 
-    fn add_typed(
-        &mut self,
-        node: TsNode,
-        source: &'a str,
-        path: &Path,
-        module: &[String],
-        parent: Option<NodeId>,
-        node_type: NodeType,
-        kind_label: &str,
-    ) {
-        let Some(name) = field_text(node, "name", source) else { return };
-        let id = self.scoped_id(module, parent.as_ref(), kind_label, &name);
-        self.insert_node(node, source, path, module, parent, id, node_type);
+    fn add_typed(&mut self, ctx: ItemCtx<'a, '_>, node_type: NodeType, kind_label: &str) {
+        let Some(name) = field_text(ctx.node, "name", ctx.source) else { return };
+        let id = self.scoped_id(ctx.module, ctx.parent.as_ref(), kind_label, &name);
+        self.insert_node(ctx, id, node_type);
     }
 
     /// `impl` nodes have no `name` field, so the tracker id is synthesized from
     /// the self type (and optional trait): `impl::for_AppState`,
     /// `impl::Handler_for_AppState`. Nested functions/consts become children.
-    fn add_impl(
-        &mut self,
-        node: TsNode,
-        source: &'a str,
-        path: &Path,
-        module: &[String],
-        parent: Option<NodeId>,
-    ) {
-        let self_type = field_text(node, "type", source).unwrap_or_else(|| "self".to_string());
-        let trait_name = field_text(node, "trait", source);
+    fn add_impl(&mut self, ctx: ItemCtx<'a, '_>) {
+        let self_type =
+            field_text(ctx.node, "type", ctx.source).unwrap_or_else(|| "self".to_string());
+        let trait_name = field_text(ctx.node, "trait", ctx.source);
         let label = match &trait_name {
             Some(t) => format!("{t}_for_{self_type}"),
             None => format!("for_{self_type}"),
         };
-        let base_id = self.scoped_id(module, parent.as_ref(), "impl", &label);
+        let base_id = self.scoped_id(ctx.module, ctx.parent.as_ref(), "impl", &label);
         let id = self.unique_id(base_id);
 
-        self.insert_node(node, source, path, module, parent, id.clone(), NodeType::Impl);
+        self.insert_node(
+            ItemCtx { parent: ctx.parent.clone(), ..ctx },
+            id.clone(),
+            NodeType::Impl,
+        );
 
         if let Some(t) = trait_name {
             self.pending_impls.push(PendingImpl {
                 impl_id: id.clone(),
                 trait_name: t,
-                module: module.to_vec(),
+                module: ctx.module.to_vec(),
             });
         }
 
-        if let Some(body) = node.child_by_field_name("body") {
-            self.walk_items(body, source, path, module, Some(id));
+        if let Some(body) = ctx.node.child_by_field_name("body") {
+            self.walk_items(body, ctx.source, ctx.path, ctx.module, Some(id));
         }
     }
 
-    fn add_mod(
-        &mut self,
-        node: TsNode,
-        source: &'a str,
-        path: &Path,
-        module: &[String],
-        parent: Option<NodeId>,
-    ) {
-        let Some(name) = field_text(node, "name", source) else { return };
+    fn add_mod(&mut self, ctx: ItemCtx<'a, '_>) {
+        let Some(name) = field_text(ctx.node, "name", ctx.source) else { return };
 
         // Bare `mod foo;` file declarations are resolved through the module
         // path, not as graph entities — only inline `mod { .. }` bodies become
         // nodes, keeping the graph sparse and structural.
-        let Some(body) = node.child_by_field_name("body") else { return };
+        let Some(body) = ctx.node.child_by_field_name("body") else { return };
 
-        let id = self.scoped_id(module, parent.as_ref(), "mod", &name);
-        self.insert_node(node, source, path, module, parent, id.clone(), NodeType::Mod);
+        let id = self.scoped_id(ctx.module, ctx.parent.as_ref(), "mod", &name);
+        self.insert_node(
+            ItemCtx { parent: ctx.parent.clone(), ..ctx },
+            id.clone(),
+            NodeType::Mod,
+        );
 
         // Inline module: recurse with an extended module path.
-        let mut child_module = module.to_vec();
+        let mut child_module = ctx.module.to_vec();
         child_module.push(name);
-        self.walk_items(body, source, path, &child_module, Some(id));
+        self.walk_items(body, ctx.source, ctx.path, &child_module, Some(id));
     }
 
     /// Shared insertion: node creation, provenance, `contains` edge, symbol
     /// registration, and deferred call/ref collection.
-    fn insert_node(
-        &mut self,
-        node: TsNode,
-        source: &'a str,
-        path: &Path,
-        module: &[String],
-        parent: Option<NodeId>,
-        id: NodeId,
-        node_type: NodeType,
-    ) {
+    fn insert_node(&mut self, ctx: ItemCtx<'a, '_>, id: NodeId, node_type: NodeType) {
         if self.graph.contains(&id) {
             self.warnings.push(format!("duplicate id skipped: {id}"));
             return;
         }
-        let body = Cow::Borrowed(&source[node.start_byte()..node.end_byte()]);
-        let range = (node.start_byte(), node.end_byte());
+        let body = Cow::Borrowed(&ctx.source[ctx.node.start_byte()..ctx.node.end_byte()]);
+        let range = (ctx.node.start_byte(), ctx.node.end_byte());
         let _ = self.graph.add_node(id.clone(), node_type, body);
-        let _ = self.graph.attach_location(&id, path.to_path_buf(), range);
+        let _ = self.graph.attach_location(&id, ctx.path.to_path_buf(), range);
 
-        if let Some(p) = parent.as_ref() {
+        if let Some(p) = ctx.parent.as_ref() {
             let _ = self.graph.add_edge(p, &id, EdgeKind::Contains);
         }
 
-        self.register_symbol(&id, module, parent.as_ref());
-        self.collect_calls_and_refs(node, source, id.clone(), module);
+        self.register_symbol(&id, ctx.module, ctx.parent.as_ref());
+        self.collect_calls_and_refs(ctx.node, ctx.source, id.clone(), ctx.module);
     }
 
     /// Build a `crate::…::kind::name` tracker id from an owned module path.
@@ -432,7 +413,7 @@ impl<'a> AsgBuilder<'a> {
         let name_field = item.child_by_field_name("name");
         for i in 0..item.named_child_count() {
             if let Some(child) = item.named_child(i) {
-                if name_field.map_or(false, |n| n == child) {
+                if name_field == Some(child) {
                     continue;
                 }
                 if is_item_kind(child.kind()) {

@@ -21,6 +21,7 @@ use crate::ast::{AstChunker, MerkleTree, TrigramIndex};
 use crate::compressor::ChunkRegistry;
 use crate::config::TokenSaverConfig;
 use crate::memory::MemoryStore;
+use crate::terminal::{ExecuteRequest, ExecuteResponse};
 use crate::persistence::PersistentStore;
 use crate::search::SearchEngine;
 use crate::tracker::{ContextTracker, CursorPayload};
@@ -958,6 +959,16 @@ pub async fn metrics_handler(State(state): State<ServerState>) -> impl IntoRespo
 // Startup
 // ---------------------------------------------------------------------------
 
+pub async fn execute_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<ExecuteRequest>,
+) -> impl IntoResponse {
+    state.total_requests.fetch_add(1, Ordering::Relaxed);
+    let workspace = state.workspace.as_path();
+    let response: ExecuteResponse = crate::terminal::execute(workspace, request).await;
+    Json(response).into_response()
+}
+
 pub fn build_router(state: ServerState, cors_origin: Option<&str>) -> Router {
     let router = Router::new()
         .route("/health", get(health_handler))
@@ -972,6 +983,7 @@ pub fn build_router(state: ServerState, cors_origin: Option<&str>) -> Router {
         .route("/v1/memories/recall", post(recall_memory_handler))
         .route("/v1/memories/{id}", delete(forget_memory_handler))
         .route("/v1/memories/{id}/update", post(update_memory_handler))
+        .route("/v1/execute", post(execute_handler))
         .with_state(state);
 
     // Apply CORS layer if an origin is configured.

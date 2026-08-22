@@ -78,7 +78,7 @@ impl SourceSet {
         });
         for entry in walker.filter_map(Result::ok) {
             let path = entry.path();
-            if entry.file_type().is_file() && path.extension().map_or(false, |e| e == ext) {
+            if entry.file_type().is_file() && path.extension().is_some_and(|e| e == ext) {
                 let text = std::fs::read_to_string(path)?;
                 set.insert(path.to_path_buf(), text);
             }

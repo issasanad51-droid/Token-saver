@@ -52,7 +52,7 @@ pub async fn watch_workspace(
                         if path_str.contains("/.git/") || path_str.contains("/target/") {
                             continue;
                         }
-                        if path.extension().map_or(true, |e| e != "rs") {
+                        if path.extension().is_none_or(|e| e != "rs") {
                             continue;
                         }
 
