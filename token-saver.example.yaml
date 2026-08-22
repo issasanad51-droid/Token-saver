@@ -6,12 +6,18 @@ debounce_ms: 150
 search:
   candidate_multiplier: 4
   semantic_min_score: 0.03
-  bm25_k1: 1.5
-  bm25_b: 0.75
   ppr_seed_candidates: 8
   context_seed_weight: 4.0
 
-  # Weighted Personalized PageRank over the custom semantic ASG.
+  # Stream A: AST-weighted lexical index. Tokens in function signatures and
+  # struct declarations weigh 3x, parameters/type names 2x, body logic 1x.
+  signature_token_weight: 3.0
+  type_token_weight: 2.0
+  body_token_weight: 1.0
+  # Exponential line-proximity scale for multi-keyword co-location.
+  proximity_line_scale: 6.0
+
+  # Weighted Personalized PageRank over the custom semantic ASG (Stream C).
   ppr:
     damping: 0.85
     epsilon: 0.00000001
@@ -25,15 +31,21 @@ search:
       field_of: 0.25
       variant_of: 0.25
 
-  # Custom RRF stream order: semantic, BM25, structural PPR.
+  # Custom Leiden community detection (Stream D).
+  leiden:
+    resolution: 1.0
+    max_levels: 8
+    min_improvement: 0.0001
+
+  # Custom RRF stream order: [lexical, semantic, structural, leiden].
   # score_alpha injects the normalized raw confidence score into the rank
   # denominator (effective_rank = rank × (1 − α × score)), so highly
   # confident matches behave as if they appeared at a better rank.
-  # Set to 0.0 for stock RRF (rank-only). Range: [0.0, 1.0].
+  # Set to 0.0 for the canonical formula Score(c) = Σ 1/(k + r_m(c)).
   rrf:
     k: 60.0
-    weights: [1.15, 1.0, 1.1]
-    score_alpha: 0.15
+    weights: [1.0, 1.0, 1.0, 1.0]
+    score_alpha: 0.0
 
 context:
   surrounding_lines: 16

@@ -111,10 +111,10 @@ mod tests {
     #[test]
     fn partial_yaml_uses_nested_defaults() {
         let config: TokenSaverConfig = serde_yaml::from_str(
-            "search:\n  rrf:\n    weights: [2.0, 1.0, 0.5]\ncontext:\n  max_dependencies: 3\n",
+            "search:\n  rrf:\n    weights: [2.0, 1.0, 1.0, 0.5]\ncontext:\n  max_dependencies: 3\n",
         )
         .unwrap();
-        assert_eq!(config.search.rrf.weights, vec![2.0, 1.0, 0.5]);
+        assert_eq!(config.search.rrf.weights, vec![2.0, 1.0, 1.0, 0.5]);
         assert_eq!(config.search.rrf.k, 60.0);
         assert_eq!(config.context.max_dependencies, 3);
         assert_eq!(config.context.surrounding_lines, 16);

@@ -14,6 +14,7 @@
 
 pub mod builder;
 pub mod graph;
+pub mod leiden;
 pub mod pagerank;
 pub mod source;
 

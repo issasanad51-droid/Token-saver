@@ -1,55 +1,88 @@
-//! Query-aware hybrid retrieval with weighted PPR and custom RRF.
+//! Hybrid Retrieval Matrix: AST-weighted lexical × dense vectors × PPR ×
+//! Leiden cluster proximity, fused by a 4-stream Reciprocal Rank Fusion loop.
 //!
-//! The live pipeline combines three deliberately different signals:
+//! Four deliberately independent ranking passes run per query:
 //!
-//! 1. deterministic local semantic feature vectors,
-//! 2. a real corpus-level BM25 lexical ranker, and
-//! 3. edge-weighted Personalized PageRank seeded by the query candidates and
-//!    the node under the editor cursor.
+//! 1. **Stream A — AST-weighted positional lexical rank.** An in-memory
+//!    inverted index maps source tokens to parent AST chunks with
+//!    tree-sitter-derived role weights (signatures/structs 3.0×, parameters
+//!    and type names 2.0×, body logic 1.0×). When several query keywords hit
+//!    one chunk, the literal line distance between the hits applies an
+//!    exponential co-location amplifier.
+//! 2. **Stream B — dense semantic similarity.** Local neural embeddings
+//!    (`BAAI/bge-small-en-v1.5` via `fastembed`) ranked by a hand-written
+//!    cosine kernel — no vector database.
+//! 3. **Stream C — Personalized PageRank** over the ASG, teleported from the
+//!    query candidates and the editor cursor node.
+//! 4. **Stream D — Leiden cluster proximity.** The workspace partition from
+//!    our custom Leiden implementation yields a deterministic cohesion vector
+//!    around the cursor node's community.
 //!
-//! The streams are fused by [`rrf`] with configurable per-stream weights and a
-//! bounded score-aware multiplier. No source code leaves the process.
+//! Fusion uses the canonical RRF formula `Score(c) = Σ 1/(k + r_m(c))` with
+//! `k = 60`, plus an ASG-topology tie-break. No source code leaves the
+//! process.
 
 pub mod rrf;
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
-use std::time::Instant;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::RwLock as AsyncRwLock;
+use tree_sitter::{Node as TsNode, Parser};
 
 use crate::asg::{
+    leiden::{detect_communities, CommunityStructure, LeidenConfig},
     EdgeKind, Node, PageRankEngine, PersonalizedPageRankConfig, SharedAsg,
 };
 use crate::compressor::ChunkRegistry;
 use crate::recency::RecencyTracker;
 use rrf::{RankedDoc, RrfConfig};
 
-const STREAM_NAMES: [&str; 3] = ["semantic", "bm25", "structural"];
-const EMBEDDING_DIMENSIONS: usize = 256;
+/// Stream order: `[lexical, semantic, structural, leiden]`.
+const STREAM_NAMES: [&str; 4] = ["lexical", "semantic", "structural", "leiden"];
+
+/// Lightweight local embedding model served entirely in-process.
+const EMBEDDING_MODEL: fastembed::EmbeddingModel = fastembed::EmbeddingModel::BGESmallENV15;
+/// Output dimensionality of `BAAI/bge-small-en-v1.5`.
+const EMBEDDING_DIMENSIONS: usize = 384;
+/// Canonical RRF rank offset (spec constant).
+const RRF_K: f64 = 60.0;
 
 // ---------------------------------------------------------------------------
 // Configuration and result types
 // ---------------------------------------------------------------------------
 
-/// Tuning knobs for candidate generation, query-time PPR, and RRF fusion.
+/// Tuning knobs for the four retrieval streams and RRF fusion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
-    /// Generate this many candidates per requested result before fusion.
+    /// Candidates generated per requested result before fusion.
     pub candidate_multiplier: usize,
     /// Ignore semantic candidates below this cosine similarity.
     pub semantic_min_score: f64,
-    pub bm25_k1: f64,
-    pub bm25_b: f64,
-    /// Number of semantic/lexical candidates used as PPR teleport seeds.
+    /// Number of lexical/semantic candidates used as PPR teleport seeds.
     pub ppr_seed_candidates: usize,
     /// Relative weight of the editor's current ASG node in the teleport vector.
     pub context_seed_weight: f64,
+    /// Weight multiplier for tokens in function signatures and struct
+    /// declarations (spec: 3.0×).
+    pub signature_token_weight: f64,
+    /// Weight multiplier for variable parameters and custom type names
+    /// (spec: 2.0×).
+    pub type_token_weight: f64,
+    /// Weight multiplier for internal body logic and block expressions
+    /// (spec: 1.0×).
+    pub body_token_weight: f64,
+    /// Exponential line-proximity scale: keyword hits `d` lines apart amplify
+    /// the chunk score by `exp(-d / proximity_line_scale)`.
+    pub proximity_line_scale: f64,
     pub ppr: PersonalizedPageRankConfig,
-    /// Stream order is `[semantic, bm25, structural]`.
+    pub leiden: LeidenConfig,
+    /// Per-stream RRF multipliers ordered `[lexical, semantic, structural,
+    /// leiden]`. Uniform weights reproduce the canonical formula exactly.
     pub rrf: RrfConfig,
 }
 
@@ -58,15 +91,18 @@ impl Default for SearchConfig {
         Self {
             candidate_multiplier: 4,
             semantic_min_score: 0.03,
-            bm25_k1: 1.5,
-            bm25_b: 0.75,
             ppr_seed_candidates: 8,
             context_seed_weight: 4.0,
+            signature_token_weight: 3.0,
+            type_token_weight: 2.0,
+            body_token_weight: 1.0,
+            proximity_line_scale: 6.0,
             ppr: PersonalizedPageRankConfig::default(),
+            leiden: LeidenConfig::default(),
             rrf: RrfConfig {
-                k: 60.0,
-                weights: vec![1.15, 1.0, 1.1],
-                score_alpha: 0.15,
+                k: RRF_K,
+                weights: vec![1.0, 1.0, 1.0, 1.0],
+                score_alpha: 0.0,
             },
         }
     }
@@ -90,6 +126,257 @@ pub struct MergedResult {
 }
 
 // ---------------------------------------------------------------------------
+// Stream A: AST-weighted lexical inverted index
+// ---------------------------------------------------------------------------
+
+/// One token occurrence inside a parent AST chunk.
+#[derive(Debug, Clone)]
+pub struct ChunkOccurrence {
+    /// Dense ASG node id of the owning chunk.
+    pub node_id: usize,
+    /// Zero-indexed line of the occurrence within the chunk.
+    pub line: usize,
+    /// Deterministic role weight (signature 3.0 / type 2.0 / body 1.0).
+    pub weight: f64,
+}
+
+/// In-memory inverted index: source token -> occurrences in AST chunks.
+#[derive(Debug, Default)]
+pub struct AstLexicalIndex {
+    inverted: HashMap<String, Vec<ChunkOccurrence>>,
+}
+
+impl AstLexicalIndex {
+    /// Build the index over every searchable chunk, weighting tokens by their
+    /// tree-sitter syntax-node role.
+    fn build(asg: &crate::asg::Asg, registry: &ChunkRegistry, config: &SearchConfig) -> Self {
+        let mut index = Self::default();
+        let mut parser = Parser::new();
+        if parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .is_err()
+        {
+            return index;
+        }
+        for node in &asg.nodes {
+            if !registry.chunks.contains_key(&node.id) {
+                continue;
+            }
+            let Some(tree) = parser.parse(node.source.as_bytes(), None) else {
+                continue;
+            };
+            let mut tokens = Vec::new();
+            collect_weighted_tokens(
+                tree.root_node(),
+                &node.source,
+                config.body_token_weight,
+                config.signature_token_weight,
+                config.type_token_weight,
+                &mut tokens,
+            );
+            for (term, weight, line) in tokens {
+                index
+                    .inverted
+                    .entry(term)
+                    .or_default()
+                    .push(ChunkOccurrence {
+                        node_id: node.id,
+                        line,
+                        weight,
+                    });
+            }
+        }
+        index
+    }
+
+    /// Score chunks for `query`: weighted term hits amplified exponentially by
+    /// the literal line distance between multiple keyword hits in one chunk.
+    fn search(
+        &self,
+        query_terms: &[String],
+        pool_size: usize,
+        proximity_line_scale: f64,
+    ) -> Vec<SearchResult> {
+        if query_terms.is_empty() {
+            return Vec::new();
+        }
+
+        // node_id -> (accumulated weight, hit lines).
+        let mut hits: HashMap<usize, (f64, Vec<usize>)> = HashMap::new();
+        let mut seen_terms: HashSet<&str> = HashSet::new();
+        for term in query_terms {
+            if !seen_terms.insert(term.as_str()) {
+                continue;
+            }
+            if let Some(occurrences) = self.inverted.get(term) {
+                for occurrence in occurrences {
+                    let entry = hits.entry(occurrence.node_id).or_default();
+                    entry.0 += occurrence.weight;
+                    entry.1.push(occurrence.line);
+                }
+            }
+        }
+
+        let scale = if proximity_line_scale.is_finite() && proximity_line_scale > 0.0 {
+            proximity_line_scale
+        } else {
+            6.0
+        };
+
+        let mut results: Vec<SearchResult> = hits
+            .into_iter()
+            .map(|(node_id, (mut score, mut lines))| {
+                if lines.len() > 1 {
+                    lines.sort_unstable();
+                    // Literal mathematical distance between the first and last
+                    // keyword hit; shorter spans scale the score exponentially.
+                    let span = (lines[lines.len() - 1].saturating_sub(lines[0])) as f64;
+                    score *= (-span / scale).exp();
+                }
+                SearchResult {
+                    node_id,
+                    score,
+                    source: STREAM_NAMES[0],
+                }
+            })
+            .filter(|result| result.score.is_finite() && result.score > 0.0)
+            .collect();
+
+        sort_results(&mut results);
+        results.truncate(pool_size);
+        results
+    }
+}
+
+/// Tree-sitter syntax-role weight for a node kind.
+///
+/// Function signatures and struct/trait/enum declarations earn the signature
+/// weight; variable parameters and custom type names earn the type weight;
+/// everything else (internal body logic, block expressions) stays at the
+/// inherited baseline.
+fn syntax_role_weight(kind: &str, signature: f64, type_weight: f64, body: f64) -> f64 {
+    match kind {
+        "function_item" | "function_signature_item" | "struct_item" | "enum_item"
+        | "trait_item" | "impl_item" | "type_item" => signature,
+        "parameter" | "parameters" | "type_identifier" | "scoped_type_identifier"
+        | "generic_type" | "field_declaration" | "enum_variant" | "where_predicate" => {
+            type_weight
+        }
+        _ => body,
+    }
+}
+
+const IDENTIFIER_KINDS: [&str; 5] = [
+    "identifier",
+    "field_identifier",
+    "type_identifier",
+    "shorthand_field_identifier",
+    "property_identifier",
+];
+
+/// Recursively collect `(lowercase token, weight, line)` triples.
+///
+/// The carried weight is the maximum role weight along the ancestor path,
+/// except that body `block`s reset to the baseline so a function's signature
+/// boost never leaks into its internal logic.
+fn collect_weighted_tokens(
+    node: TsNode<'_>,
+    source: &str,
+    inherited: f64,
+    signature: f64,
+    type_weight: f64,
+    out: &mut Vec<(String, f64, usize)>,
+) {
+    let kind = node.kind();
+    let level = if kind == "block" {
+        inherited.min(1.0_f64.max(f64::MIN_POSITIVE))
+    } else {
+        syntax_role_weight(kind, signature, type_weight, 1.0).max(inherited)
+    };
+
+    if IDENTIFIER_KINDS.contains(&kind) {
+        if let Ok(text) = node.utf8_text(source.as_bytes()) {
+            out.push((text.to_lowercase(), level, node.start_position().row));
+        }
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_weighted_tokens(child, source, level, signature, type_weight, out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dense vector helpers
+// ---------------------------------------------------------------------------
+
+/// Hyper-fast cosine similarity over raw `f32` slices. Single pass, no
+/// allocations, no normalization assumptions beyond non-zero magnitudes.
+#[inline]
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    let (mut dot, mut norm_a, mut norm_b) = (0.0f32, 0.0f32, 0.0f32);
+    for i in 0..len {
+        let x = a[i];
+        let y = b[i];
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denominator = norm_a.sqrt() * norm_b.sqrt();
+    if denominator > f32::MIN_POSITIVE {
+        dot / denominator
+    } else {
+        0.0
+    }
+}
+
+/// Deterministic offline fallback embedding (double-hashed bag of features).
+/// Used only when the neural model cannot be initialized; keeps Stream B
+/// functional with degraded semantics.
+fn embed_text_fallback(text: &str) -> Vec<f32> {
+    let mut vector = vec![0.0f32; EMBEDDING_DIMENSIONS];
+    for term in tokenize(text) {
+        add_feature(&mut vector, &term, 1.0);
+        let characters: Vec<char> = term.chars().collect();
+        for trigram in characters.windows(3) {
+            let feature: String = trigram.iter().collect();
+            add_feature(&mut vector, &feature, 0.2);
+        }
+    }
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > f32::MIN_POSITIVE {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
+}
+
+/// Double-hashing feature insertion eliminates systematic bias from
+/// single-hash collision patterns.
+fn add_feature(vector: &mut [f32], feature: &str, weight: f32) {
+    let mut hasher1 = std::collections::hash_map::DefaultHasher::new();
+    feature.hash(&mut hasher1);
+    let h1 = hasher1.finish();
+
+    let mut hasher2 = std::collections::hash_map::DefaultHasher::new();
+    0x9e3779b97f4a7c15u64.hash(&mut hasher2);
+    feature.hash(&mut hasher2);
+    let h2 = hasher2.finish();
+
+    let dim = vector.len();
+    let index = (h1 as usize) % dim;
+    let sign = if h1 & (1 << 63) == 0 { 1.0 } else { -1.0 };
+    let index2 = ((h1 as usize).wrapping_add(h2 as usize)) % dim;
+    let sign2 = if h2 & (1 << 63) == 0 { 1.0 } else { -1.0 };
+
+    vector[index] += sign * weight;
+    vector[index2] += sign2 * weight * 0.5;
+}
+
+// ---------------------------------------------------------------------------
 // Search engine
 // ---------------------------------------------------------------------------
 
@@ -98,14 +385,14 @@ pub struct SearchEngine {
     asg: SharedAsg,
     registry: Arc<ChunkRegistry>,
     config: SearchConfig,
-    /// Precomputed local feature vectors keyed by dense ASG node ID.
-    embeddings: Arc<RwLock<HashMap<usize, Vec<f64>>>>,
-    /// Cached tokenized document terms for BM25 (node_id -> terms).
-    document_terms: Arc<RwLock<HashMap<usize, Vec<String>>>>,
-    /// Timestamp of last access for temporal decay.
-    last_access: Arc<std::sync::Mutex<Instant>>,
-    /// Temporal decay factor per second (default 0.995, half-life ~138s).
-    decay_factor: f64,
+    /// Stream A: token -> chunk occurrences with AST role weights.
+    lexical_index: Arc<AsyncRwLock<AstLexicalIndex>>,
+    /// Stream B: dense node embeddings (model-space `f32` vectors).
+    embeddings: Arc<AsyncRwLock<HashMap<usize, Vec<f32>>>>,
+    /// The local neural embedder held directly in runtime server state.
+    embedder: Arc<RwLock<Option<fastembed::TextEmbedding>>>,
+    /// Stream D: Leiden community assignment over the workspace.
+    communities: Arc<AsyncRwLock<Option<CommunityStructure>>>,
     /// Sliding-window recency tracker that boosts recently touched nodes in
     /// the PPR teleport vector.
     recency: Arc<RecencyTracker>,
@@ -121,10 +408,10 @@ impl SearchEngine {
             asg,
             registry: Arc::new(registry),
             config,
-            embeddings: Arc::new(RwLock::new(HashMap::new())),
-            document_terms: Arc::new(RwLock::new(HashMap::new())),
-            last_access: Arc::new(std::sync::Mutex::new(Instant::now())),
-            decay_factor: 0.995,
+            lexical_index: Arc::new(AsyncRwLock::new(AstLexicalIndex::default())),
+            embeddings: Arc::new(AsyncRwLock::new(HashMap::new())),
+            embedder: Arc::new(RwLock::new(None)),
+            communities: Arc::new(AsyncRwLock::new(None)),
             recency: Arc::new(RecencyTracker::new()),
         }
     }
@@ -143,40 +430,94 @@ impl SearchEngine {
         &self.config
     }
 
-    /// Apply temporal decay to PPR scores so stale code fades over time.
-    /// Each score is multiplied by `decay_factor^elapsed_secs`.
-    pub fn apply_temporal_decay(&self, scores: &mut [f64]) {
-        let last = *self.last_access.lock().unwrap();
-        let elapsed = last.elapsed().as_secs_f64();
-        if elapsed <= 0.0 || !self.decay_factor.is_finite() {
-            return;
+    /// Initialize the local `fastembed` model (downloads weights on first run,
+    /// cached on disk afterwards). Safe to call repeatedly.
+    pub async fn init_embedder(&self) -> bool {
+        if self.embedder.read().unwrap().is_some() {
+            return true;
         }
-        let decay = self.decay_factor.powf(elapsed);
-        for score in scores.iter_mut() {
-            *score *= decay;
-        }
-    }
-
-    /// Update the last access timestamp to now.
-    pub fn touch_access(&self) {
-        *self.last_access.lock().unwrap() = Instant::now();
-    }
-
-    /// Precompute vectors and document terms once. The feature hasher is
-    /// deterministic, local, dependency-free, and gives exact identifiers
-    /// substantially more weight than fuzzy character trigrams.
-    pub async fn precompute_embeddings(&self) {
-        let mut embeddings = self.embeddings.write().await;
-        let mut doc_terms = self.document_terms.write().await;
-        embeddings.clear();
-        doc_terms.clear();
-        for node in &self.asg.inner.nodes {
-            if self.is_searchable(node.id) {
-                let ctx_text = contextual_text(node, &self.asg.inner);
-                embeddings.insert(node.id, embed_text(&ctx_text));
-                doc_terms.insert(node.id, tokenize(&ctx_text));
+        let slot = self.embedder.clone();
+        tokio::task::spawn_blocking(move || {
+            let options = fastembed::InitOptions::new(EMBEDDING_MODEL)
+                .with_show_download_progress(false)
+                .with_cache_dir(fastembed_cache_dir());
+            match fastembed::TextEmbedding::try_new(options) {
+                Ok(model) => {
+                    *slot.write().unwrap() = Some(model);
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "fastembed init failed, falling back to local features: {error}"
+                    );
+                    false
+                }
             }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Embed a batch of texts through the live model, falling back to the
+    /// deterministic local embedder when the model is unavailable.
+    async fn embed_batch(&self, texts: Vec<String>) -> Vec<Vec<f32>> {
+        if texts.is_empty() {
+            return Vec::new();
         }
+        let slot = self.embedder.clone();
+        let count = texts.len();
+        let owned = texts.clone();
+        let neural = tokio::task::spawn_blocking(move || {
+            let guard = slot.read().unwrap();
+            guard.as_ref().map(|model| model.embed(owned, None))
+        })
+        .await;
+
+        match neural {
+            Ok(Some(Ok(vectors))) if vectors.len() == count => vectors,
+            _ => texts
+                .iter()
+                .map(|text| embed_text_fallback(text))
+                .collect(),
+        }
+    }
+
+    /// Precompute every retrieval structure once: AST-weighted lexical index,
+    /// dense embeddings, and the Leiden community partition.
+    pub async fn precompute_embeddings(&self) {
+        self.init_embedder().await;
+
+        let lexical = AstLexicalIndex::build(&self.asg.inner, &self.registry, &self.config);
+        *self.lexical_index.write().await = lexical;
+
+        let texts: Vec<(usize, String)> = self
+            .asg
+            .inner
+            .nodes
+            .iter()
+            .filter(|node| self.is_searchable(node.id))
+            .map(|node| (node.id, contextual_text(node, &self.asg.inner)))
+            .collect();
+        let vectors = self
+            .embed_batch(texts.iter().map(|(_, text)| text.clone()).collect())
+            .await;
+        let mut embeddings: HashMap<usize, Vec<f32>> = HashMap::with_capacity(texts.len());
+        for ((node_id, _), vector) in texts.into_iter().zip(vectors) {
+            embeddings.insert(node_id, vector);
+        }
+        *self.embeddings.write().await = embeddings;
+
+        let asg = self.asg.clone();
+        let leiden_config = self.config.leiden.clone();
+        let structure = tokio::task::spawn_blocking(move || {
+            detect_communities(&asg.inner, &leiden_config)
+        })
+        .await
+        .unwrap_or_else(|_| CommunityStructure {
+            assignment: Vec::new(),
+            community_count: 0,
+        });
+        *self.communities.write().await = Some(structure);
     }
 
     /// Search without editor context.
@@ -184,9 +525,8 @@ impl SearchEngine {
         self.search_with_context(query, top_k, None).await
     }
 
-    /// Run semantic and BM25 candidate generation in parallel, seed a
-    /// query-specific weighted PPR pass from those candidates and the optional
-    /// cursor node, then fuse all three rankings.
+    /// Run the four ranking passes concurrently, then merge them with the
+    /// canonical Reciprocal Rank Fusion formula (`k = 60`).
     pub async fn search_with_context(
         &self,
         query: &str,
@@ -200,77 +540,57 @@ impl SearchEngine {
             self.precompute_embeddings().await;
         }
 
-        self.touch_access();
-
         let pool_size = top_k
             .saturating_mul(self.config.candidate_multiplier.max(1))
             .max(top_k)
             .min(self.asg.inner.nodes.len());
+        let query_terms = tokenize(query);
 
-        let query_vector = embed_text(query);
-        let vector_asg = self.asg.clone();
-        let vector_embeddings = self.embeddings.clone();
-        let vector_registry = self.registry.clone();
-        let semantic_floor = if self.config.semantic_min_score.is_finite() {
-            self.config.semantic_min_score
-        } else {
-            0.0
-        };
-        let semantic_task = tokio::spawn(async move {
-            Self::semantic_search(
-                vector_asg,
-                vector_registry,
-                vector_embeddings,
-                query_vector,
-                semantic_floor,
-                pool_size,
-            )
-            .await
-        });
-
-        let lexical_asg = self.asg.clone();
-        let lexical_registry = self.registry.clone();
-        let lexical_query = query.to_owned();
-        let k1 = self.config.bm25_k1;
-        let b = self.config.bm25_b;
-        let lexical_document_terms = self.document_terms.clone();
+        // ---- Streams A + B run in parallel tasks --------------------------
+        let lexical_index = self.lexical_index.clone();
+        let lexical_query = query_terms.clone();
+        let lexical_pool = pool_size;
+        let lexical_scale = self.config.proximity_line_scale;
         let lexical_task = tokio::spawn(async move {
-            Self::bm25_search(
-                lexical_asg,
-                lexical_registry,
-                lexical_document_terms,
-                &lexical_query,
-                k1,
-                b,
-                pool_size,
-            )
-            .await
+            let index = lexical_index.read().await;
+            index.search(&lexical_query, lexical_pool, lexical_scale)
         });
 
-        let semantic = semantic_task.await.unwrap_or_default();
-        let lexical = lexical_task.await.unwrap_or_default();
+        let vector_engine = self.clone();
+        let vector_query = query.to_owned();
+        let vector_floor = self.config.semantic_min_score.max(0.0) as f32;
+        let vector_pool = pool_size;
+        let semantic_task = tokio::spawn(async move {
+            vector_engine
+                .semantic_search(&vector_query, vector_floor, vector_pool)
+                .await
+        });
 
-        let seeds = self.ppr_seeds(&semantic, &lexical, context_node);
-        let structural_asg = self.asg.clone();
-        let structural_registry = self.registry.clone();
+        let lexical = lexical_task.await.unwrap_or_default();
+        let semantic = semantic_task.await.unwrap_or_default();
+
+        // ---- Stream C: PPR teleported from query candidates + cursor ------
+        let seeds = self.ppr_seeds(&lexical, &semantic, context_node);
+        let ppr_asg = self.asg.clone();
+        let ppr_registry = self.registry.clone();
         let ppr_config = self.config.ppr.clone();
-        let decay_factor = self.decay_factor;
-        let last_access = self.last_access.clone();
         let structural = tokio::task::spawn_blocking(move || {
-            Self::structural_search(
-                structural_asg,
-                structural_registry,
-                ppr_config,
-                seeds,
-                pool_size,
-                decay_factor,
-                last_access,
-            )
+            Self::structural_search(ppr_asg, ppr_registry, ppr_config, seeds, pool_size)
         })
         .await
         .unwrap_or_default();
 
-        self.fuse(semantic, lexical, structural, top_k)
+        // ---- Stream D: Leiden cluster proximity ---------------------------
+        let leiden_anchor =
+            context_node.or_else(|| {
+                lexical
+                    .first()
+                    .or_else(|| semantic.first())
+                    .map(|result| result.node_id)
+            });
+        let leiden = self.leiden_proximity(leiden_anchor, pool_size).await;
+
+        self.fuse(lexical, semantic, structural, leiden, top_k)
     }
 
     fn is_searchable(&self, node_id: usize) -> bool {
@@ -278,136 +598,28 @@ impl SearchEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Semantic stream
+    // Stream B: dense vector semantic search
     // -----------------------------------------------------------------------
 
     async fn semantic_search(
-        asg: SharedAsg,
-        registry: Arc<ChunkRegistry>,
-        embeddings: Arc<RwLock<HashMap<usize, Vec<f64>>>>,
-        query_vector: Vec<f64>,
-        minimum_score: f64,
+        &self,
+        query: &str,
+        minimum_score: f32,
         top_k: usize,
     ) -> Vec<SearchResult> {
-        let embeddings = embeddings.read().await;
+        let mut query_vector = self.embed_batch(vec![query.to_owned()]).await;
+        let Some(query_vector) = query_vector.pop() else {
+            return Vec::new();
+        };
+
+        let embeddings = self.embeddings.read().await;
         let mut results = Vec::new();
-        for (node_id, node_vector) in embeddings.iter() {
-            if asg.get_node(*node_id).is_none() || !registry.chunks.contains_key(node_id) {
+        for (&node_id, node_vector) in embeddings.iter() {
+            if !self.registry.chunks.contains_key(&node_id) {
                 continue;
             }
-            let score = cosine_similarity(&query_vector, node_vector);
-            if score.is_finite() && score >= minimum_score {
-                results.push(SearchResult {
-                    node_id: *node_id,
-                    score,
-                    source: STREAM_NAMES[0],
-                });
-            }
-        }
-        sort_results(&mut results);
-        results.truncate(top_k);
-        results
-    }
-
-    // -----------------------------------------------------------------------
-    // BM25 stream
-    // -----------------------------------------------------------------------
-
-    async fn bm25_search(
-        asg: SharedAsg,
-        registry: Arc<ChunkRegistry>,
-        document_terms_cache: Arc<RwLock<HashMap<usize, Vec<String>>>>,
-        query: &str,
-        configured_k1: f64,
-        configured_b: f64,
-        top_k: usize,
-    ) -> Vec<SearchResult> {
-        let query_terms: Vec<String> = tokenize(query);
-        if query_terms.is_empty() {
-            return Vec::new();
-        }
-        let unique_query: HashSet<&str> = query_terms.iter().map(String::as_str).collect();
-
-        // Use cached document terms if available, otherwise fall back to
-        // re-tokenizing from searchable text.
-        let cached = document_terms_cache.read().await;
-        let documents: Vec<(usize, Vec<String>)> = if !cached.is_empty() {
-            asg.inner
-                .nodes
-                .iter()
-                .filter(|node| registry.chunks.contains_key(&node.id))
-                .filter_map(|node| {
-                    cached
-                        .get(&node.id)
-                        .map(|terms| (node.id, terms.clone()))
-                })
-                .collect()
-        } else {
-            drop(cached);
-            asg.inner
-                .nodes
-                .iter()
-                .filter(|node| registry.chunks.contains_key(&node.id))
-                .map(|node| {
-                    let ctx_text = contextual_text(node, &asg.inner);
-                    (node.id, tokenize(&ctx_text))
-                })
-                .collect()
-        };
-        if documents.is_empty() {
-            return Vec::new();
-        }
-
-        let average_length = documents
-            .iter()
-            .map(|(_, terms)| terms.len())
-            .sum::<usize>() as f64
-            / documents.len() as f64;
-        let document_count = documents.len() as f64;
-        let k1 = if configured_k1.is_finite() {
-            configured_k1.max(0.01)
-        } else {
-            1.5
-        };
-        let b = if configured_b.is_finite() {
-            configured_b.clamp(0.0, 1.0)
-        } else {
-            0.75
-        };
-
-        let mut document_frequency: HashMap<&str, usize> = HashMap::new();
-        for term in &unique_query {
-            let count = documents
-                .iter()
-                .filter(|(_, terms)| terms.iter().any(|candidate| candidate.as_str() == *term))
-                .count();
-            document_frequency.insert(*term, count);
-        }
-
-        let mut results = Vec::new();
-        for (node_id, terms) in documents {
-            let document_length = terms.len().max(1) as f64;
-            let mut frequencies: HashMap<&str, usize> = HashMap::new();
-            for term in &terms {
-                if unique_query.contains(term.as_str()) {
-                    *frequencies.entry(term.as_str()).or_default() += 1;
-                }
-            }
-
-            let mut score = 0.0;
-            for query_term in &query_terms {
-                let term = query_term.as_str();
-                let tf = *frequencies.get(term).unwrap_or(&0) as f64;
-                if tf == 0.0 {
-                    continue;
-                }
-                let df = *document_frequency.get(term).unwrap_or(&0) as f64;
-                let idf = (1.0 + (document_count - df + 0.5) / (df + 0.5)).ln();
-                let length_norm = 1.0 - b + b * document_length / average_length.max(1.0);
-                score += idf * (tf * (k1 + 1.0)) / (tf + k1 * length_norm);
-            }
-
-            if score.is_finite() && score > 0.0 {
+            let score = cosine_similarity(&query_vector, node_vector) as f64;
+            if score.is_finite() && score >= minimum_score as f64 {
                 results.push(SearchResult {
                     node_id,
                     score,
@@ -421,13 +633,13 @@ impl SearchEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Weighted Personalized PageRank stream
+    // Stream C: Personalized PageRank
     // -----------------------------------------------------------------------
 
     fn ppr_seeds(
         &self,
-        semantic: &[SearchResult],
         lexical: &[SearchResult],
+        semantic: &[SearchResult],
         context_node: Option<usize>,
     ) -> Vec<(usize, f64)> {
         let mut seeds: HashMap<usize, f64> = HashMap::new();
@@ -441,10 +653,10 @@ impl SearchEngine {
         }
 
         let limit = self.config.ppr_seed_candidates.max(1);
-        for stream in [semantic, lexical] {
+        for stream in [lexical, semantic] {
             for (rank, result) in stream.iter().take(limit).enumerate() {
-                // Rank-normalized seed weights avoid mixing incomparable cosine
-                // and BM25 score scales before PPR.
+                // Rank-normalized seed weights avoid mixing incomparable
+                // cosine and lexical score scales before PPR.
                 *seeds.entry(result.node_id).or_default() += 1.0 / (rank + 1) as f64;
             }
         }
@@ -459,31 +671,14 @@ impl SearchEngine {
         config: PersonalizedPageRankConfig,
         seeds: Vec<(usize, f64)>,
         top_k: usize,
-        decay_factor: f64,
-        last_access: Arc<std::sync::Mutex<Instant>>,
     ) -> Vec<SearchResult> {
         let engine = PageRankEngine::from_config(config);
         let scores = engine.personalized_scores(&asg.inner, &seeds);
 
-        // Apply temporal decay to PPR scores so stale code fades over time.
-        let mut scores = scores;
-        {
-            let last = *last_access.lock().unwrap();
-            let elapsed = last.elapsed().as_secs_f64();
-            if elapsed > 0.0 && decay_factor.is_finite() {
-                let decay = decay_factor.powf(elapsed);
-                for score in scores.iter_mut() {
-                    *score *= decay;
-                }
-            }
-        }
-
         let mut results: Vec<SearchResult> = scores
             .into_iter()
             .enumerate()
-            .filter(|(node_id, score)| {
-                *score > 0.0 && registry.chunks.contains_key(node_id)
-            })
+            .filter(|(node_id, score)| *score > 0.0 && registry.chunks.contains_key(node_id))
             .map(|(node_id, score)| SearchResult {
                 node_id,
                 score,
@@ -496,17 +691,47 @@ impl SearchEngine {
     }
 
     // -----------------------------------------------------------------------
-    // ASG structural dependency scores (for RRF tie-breaking)
+    // Stream D: Leiden cluster proximity
     // -----------------------------------------------------------------------
 
-    /// Compute per-node ASG structural dependency weights used as a
-    /// deterministic tie-breaker inside the RRF fusion.  Only weighted
-    /// incoming `calls` and `references` edges count — the two edge kinds
-    /// that carry genuine structural signal in a code graph (as opposed to
-    /// lexical `contains` nesting).
-    ///
-    /// Weights are taken from `search.ppr.edge_weights` so they stay
-    /// consistent with the PPR structural stream.
+    /// Deterministic proximity vector: chunks inside the anchor's community
+    /// score 1.0; neighbouring communities score proportionally to normalized
+    /// inter-community edge cohesion; everything else scores 0.0.
+    async fn leiden_proximity(
+        &self,
+        anchor_node: Option<usize>,
+        top_k: usize,
+    ) -> Vec<SearchResult> {
+        let communities = self.communities.read().await;
+        let Some(structure) = communities.as_ref() else {
+            return Vec::new();
+        };
+        let Some(anchor) = anchor_node.and_then(|id| structure.community_of(id)) else {
+            return Vec::new();
+        };
+
+        let scores = structure.proximity_scores(&self.asg.inner, anchor);
+        let mut results: Vec<SearchResult> = scores
+            .into_iter()
+            .enumerate()
+            .filter(|(node_id, score)| *score > 0.0 && self.is_searchable(*node_id))
+            .map(|(node_id, score)| SearchResult {
+                node_id,
+                score,
+                source: STREAM_NAMES[3],
+            })
+            .collect();
+        sort_results(&mut results);
+        results.truncate(top_k);
+        results
+    }
+
+    // -----------------------------------------------------------------------
+    // ASG structural dependency scores (RRF tie-breaking)
+    // -----------------------------------------------------------------------
+
+    /// Weighted incoming `calls` + `references` edges — the two edge kinds
+    /// that carry genuine structural signal — used to break exact RRF ties.
     fn compute_structural_dependency_scores(&self) -> HashMap<usize, f64> {
         let mut scores = HashMap::with_capacity(self.asg.inner.nodes.len());
         for node in &self.asg.inner.nodes {
@@ -523,8 +748,6 @@ impl SearchEngine {
                             match edge.kind {
                                 EdgeKind::Calls => self.config.ppr.edge_weights.calls,
                                 EdgeKind::References => self.config.ppr.edge_weights.references,
-                                // Only calls and references are true structural
-                                // dependencies; contains/imports/etc. are excluded.
                                 _ => 0.0,
                             }
                         })
@@ -537,17 +760,18 @@ impl SearchEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Custom RRF
+    // 4-stream Reciprocal Rank Fusion
     // -----------------------------------------------------------------------
 
     fn fuse(
         &self,
-        semantic: Vec<SearchResult>,
         lexical: Vec<SearchResult>,
+        semantic: Vec<SearchResult>,
         structural: Vec<SearchResult>,
+        leiden: Vec<SearchResult>,
         top_k: usize,
     ) -> Vec<MergedResult> {
-        let original_streams = [&semantic, &lexical, &structural];
+        let original_streams = [&lexical, &semantic, &structural, &leiden];
         let ranked_streams: Vec<Vec<RankedDoc<usize>>> = original_streams
             .iter()
             .map(|stream| {
@@ -558,8 +782,6 @@ impl SearchEngine {
             })
             .collect();
 
-        // Pre-compute per-node structural dependency weights so the RRF
-        // fusion can break ties deterministically via ASG topology.
         let structural_dependency_scores = self.compute_structural_dependency_scores();
 
         let mut merged: Vec<MergedResult> = rrf::fuse(
@@ -593,15 +815,20 @@ impl SearchEngine {
     }
 }
 
+fn sort_results(results: &mut [SearchResult]) {
+    results.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+}
+
 // ---------------------------------------------------------------------------
-// Local text features
+// Text features
 // ---------------------------------------------------------------------------
 
 fn searchable_text(node: &Node) -> String {
-    // Include tracker_id once (not the name three times), and include kind
-    // for type filtering. The body provides lexical coverage of internal
-    // concepts. Repeating the body boosts term frequency for code-internal
-    // identifiers without the fragile triple-name hack.
     format!(
         "{} {} {}\n{}\n{}",
         node.tracker_id, node.name, node.kind, node.source, node.source
@@ -609,15 +836,12 @@ fn searchable_text(node: &Node) -> String {
 }
 
 /// Contextual text wraps searchable_text with module context from the
-/// tracker_id hierarchy. This helps BM25 and semantic search understand
-/// what module a chunk belongs to.
+/// tracker_id hierarchy so both streams understand what module a chunk
+/// belongs to.
 fn contextual_text(node: &Node, _asg: &crate::asg::Asg) -> String {
     let base = searchable_text(node);
-    // Find the parent module by looking at the tracker_id hierarchy.
-    // e.g. "crate::server::mod::fn::handler" → parent module is "crate::server::mod"
     let parts: Vec<&str> = node.tracker_id.split("::").collect();
     if parts.len() > 2 {
-        // Include the module path as context prefix for BM25/semantic search.
         let module_context = parts[..parts.len().saturating_sub(1)].join("::");
         format!("[module: {}]\n{}", module_context, base)
     } else {
@@ -625,6 +849,7 @@ fn contextual_text(node: &Node, _asg: &crate::asg::Asg) -> String {
     }
 }
 
+/// Split text into lowercase sub-word terms (camelCase and snake_case aware).
 fn tokenize(text: &str) -> Vec<String> {
     let mut terms = Vec::new();
     let mut current = String::new();
@@ -652,71 +877,29 @@ fn tokenize(text: &str) -> Vec<String> {
     terms
 }
 
-fn embed_text(text: &str) -> Vec<f64> {
-    let mut vector = vec![0.0; EMBEDDING_DIMENSIONS];
-    for term in tokenize(text) {
-        add_feature(&mut vector, &term, 1.0);
-        let characters: Vec<char> = term.chars().collect();
-        for trigram in characters.windows(3) {
-            let feature: String = trigram.iter().collect();
-            add_feature(&mut vector, &feature, 0.2);
-        }
-    }
-    let norm = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
-    if norm > 0.0 {
-        for value in &mut vector {
-            *value /= norm;
-        }
-    }
-    vector
+/// Model cache directory so the embedding weights download exactly once.
+fn fastembed_cache_dir() -> PathBuf {
+    std::env::var_os("TOKEN_SAVER_EMBED_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("token-saver-fastembed"))
 }
 
-/// Double-hashing feature insertion eliminates systematic bias from
-/// single-hash collision patterns. The second hash (h2) provides an
-/// independent offset so that features with colliding h1 indices don't
-/// always collide on the same dimension.
-fn add_feature(vector: &mut [f64], feature: &str, weight: f64) {
-    let mut hasher1 = std::collections::hash_map::DefaultHasher::new();
-    feature.hash(&mut hasher1);
-    let h1 = hasher1.finish();
-
-    let mut hasher2 = std::collections::hash_map::DefaultHasher::new();
-    // Offset the second hash with a different seed to ensure independence.
-    0x9e3779b97f4a7c15u64.hash(&mut hasher2);
-    feature.hash(&mut hasher2);
-    let h2 = hasher2.finish();
-
-    let dim = vector.len();
-    let index = (h1 as usize) % dim;
-    let sign = if h1 & (1 << 63) == 0 { 1.0 } else { -1.0 };
-    // Secondary dimension with h2-offset breaks systematic collision
-    // patterns between features that share the same primary index.
-    let index2 = ((h1 as usize).wrapping_add(h2 as usize)) % dim;
-    let sign2 = if h2 & (1 << 63) == 0 { 1.0 } else { -1.0 };
-
-    vector[index] += sign * weight;
-    vector[index2] += sign2 * weight * 0.5;
-}
-
-fn cosine_similarity(left: &[f64], right: &[f64]) -> f64 {
-    if left.len() != right.len() || left.is_empty() {
-        return 0.0;
-    }
-    left.iter().zip(right).map(|(a, b)| a * b).sum()
-}
-
-fn sort_results(results: &mut [SearchResult]) {
-    results.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
-            .then_with(|| left.node_id.cmp(&right.node_id))
-    });
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cosine_similarity_basics() {
+        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+        assert!((cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < 1e-6);
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+    }
 
     #[test]
     fn tokenizer_splits_snake_and_camel_case() {
@@ -727,8 +910,11 @@ mod tests {
     }
 
     #[test]
-    fn identical_text_has_unit_cosine() {
-        let vector = embed_text("personalized page rank");
-        assert!((cosine_similarity(&vector, &vector) - 1.0).abs() < 1e-12);
+    fn fallback_embeddings_are_unit_length_and_deterministic() {
+        let a = embed_text_fallback("fn retrieve_chunks(query)");
+        let b = embed_text_fallback("fn retrieve_chunks(query)");
+        assert_eq!(a, b);
+        let norm: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4);
     }
 }
