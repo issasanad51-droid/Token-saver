@@ -31,6 +31,16 @@ use super::{Asg, EdgeKind};
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Upper bound for scores assigned to nodes in communities *adjacent* to
+/// the seed community. Keeps the retrieval ranking strict: membership in
+/// the seed community (`1.0`) always outranks an adjacent community, which
+/// always outranks everything else (`0.0`) — even when the bridge into the
+/// seed community is the strongest inter-community edge in the graph.
+/// Without this cap, `w / max_cohesion` hits `1.0` whenever the seed's
+/// bridge dominates, making "different community, weakly connected"
+/// indistinguishable from "same community".
+const ADJACENT_COMMUNITY_MAX: f64 = 0.5;
+
 /// Tunables for the deterministic Leiden partitioner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -102,7 +112,9 @@ impl CommunityStructure {
     ///
     /// Nodes inside `seed_community` score `1.0`. Nodes in directly adjacent
     /// communities score proportionally to the normalized inter-community
-    /// edge weight (network cohesion). Everything else scores `0.0`.
+    /// edge weight (network cohesion), capped at `ADJACENT_COMMUNITY_MAX`
+    /// so they can never tie with or outrank seed-community members.
+    /// Everything else scores `0.0`.
     pub fn proximity_scores(&self, asg: &Asg, seed_community: usize) -> Vec<f64> {
         let mut scores = vec![0.0; self.assignment.len()];
         if self.community_count == 0 {
@@ -139,7 +151,7 @@ impl CommunityStructure {
                     community.max(seed_community),
                 );
                 if let Some(&w) = cohesion.get(&key) {
-                    scores[node] = w / max_cohesion;
+                    scores[node] = ADJACENT_COMMUNITY_MAX * (w / max_cohesion);
                 }
             }
         }
@@ -528,6 +540,55 @@ mod tests {
         let a = detect_communities(&asg, &LeidenConfig::default());
         let b = detect_communities(&asg, &LeidenConfig::default());
         assert_eq!(a.assignment, b.assignment);
+    }
+
+    #[test]
+    fn adjacent_scores_strictly_below_seed_and_zero_elsewhere() {
+        // Regression: with only two bridged communities the seed's bridge is
+        // the strongest (only) inter-community edge, so the old
+        // `w / max_cohesion` normalization scored the adjacent community at
+        // exactly 1.0 — a full tie with seed membership. Three triangles:
+        // 0-1-2 bridged to 3-4-5; 6-7-8 completely disconnected.
+        let edges = [
+            (0, 1),
+            (1, 2),
+            (0, 2),
+            (3, 4),
+            (4, 5),
+            (3, 5),
+            (2, 3),
+            (6, 7),
+            (7, 8),
+            (6, 8),
+        ];
+        let asg = asg_with(&edges);
+        let structure = detect_communities(&asg, &LeidenConfig::default());
+
+        let seed = structure.community_of(0).unwrap();
+        let adjacent = structure.community_of(3).unwrap();
+        let far = structure.community_of(6).unwrap();
+        assert_ne!(seed, adjacent);
+        assert_ne!(seed, far);
+        assert_ne!(adjacent, far);
+
+        let scores = structure.proximity_scores(&asg, seed);
+        for node in 0..3 {
+            assert_eq!(scores[node], 1.0, "seed member {node}");
+        }
+        for node in 3..6 {
+            let s = scores[node];
+            assert!(
+                s > 0.0 && s < 1.0,
+                "adjacent member {node} must get partial credit strictly below 1.0, got {s}"
+            );
+            assert!(
+                s <= ADJACENT_COMMUNITY_MAX,
+                "adjacent member {node} must respect the cap, got {s}"
+            );
+        }
+        for node in 6..9 {
+            assert_eq!(scores[node], 0.0, "non-adjacent member {node}");
+        }
     }
 
     #[test]
