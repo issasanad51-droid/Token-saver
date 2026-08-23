@@ -76,42 +76,129 @@ impl BridgeMapper {
     /// Returns the number of edges added.
     pub fn link_bridges(&self, asg: &mut Asg) -> usize {
         let mut by_bridge: HashMap<Bridge, Vec<usize>> = HashMap::new();
+        // resource name (SQL table / API path segment) -> nodes mentioning it
+        let mut by_resource: HashMap<String, Vec<usize>> = HashMap::new();
         for node in &asg.nodes {
             for bridge in self.extract(&node.source) {
+                match &bridge {
+                    Bridge::Sql(sql) => {
+                        for table in sql_tables(sql) {
+                            by_resource
+                                .entry(table)
+                                .or_default()
+                                .push(node.id);
+                        }
+                    }
+                    Bridge::Api(path) => {
+                        for resource in api_resources(path) {
+                            by_resource
+                                .entry(resource)
+                                .or_default()
+                                .push(node.id);
+                        }
+                    }
+                }
                 by_bridge.entry(bridge).or_default().push(node.id);
             }
         }
 
-        let mut added = 0usize;
         let mut seen = std::collections::HashSet::new();
-        for (_, node_ids) in by_bridge {
+        let connect = |from: usize,
+                       to: usize,
+                       asg: &mut Asg,
+                       seen: &mut std::collections::HashSet<(usize, usize)>| {
+            if from == to || !seen.insert((from, to)) {
+                return;
+            }
+            let edge_index = asg.edges.len();
+            asg.edges.push(Edge {
+                from,
+                to,
+                kind: EdgeKind::Bridge,
+            });
+            asg.adjacency.entry(from).or_default().push(edge_index);
+            asg.reverse_adjacency.entry(to).or_default().push(edge_index);
+        };
+
+        // Exact same bridge string (two identical SQL statements, two
+        // callers of the same endpoint): link every ordered pair.
+        for node_ids in by_bridge.values() {
             if node_ids.len() < 2 {
                 continue;
             }
-            // Link every pair sharing the bridge (directed both ways).
-            for i in 0..node_ids.len() {
-                for j in 0..node_ids.len() {
-                    if i == j {
-                        continue;
-                    }
-                    let (from, to) = (node_ids[i], node_ids[j]);
-                    if !seen.insert((from, to)) {
-                        continue;
-                    }
-                    let edge_index = asg.edges.len();
-                    asg.edges.push(Edge {
-                        from,
-                        to,
-                        kind: EdgeKind::Bridge,
-                    });
-                    asg.adjacency.entry(from).or_default().push(edge_index);
-                    asg.reverse_adjacency.entry(to).or_default().push(edge_index);
-                    added += 1;
+            for &from in node_ids {
+                for &to in node_ids {
+                    connect(from, to, asg, &mut seen);
                 }
             }
         }
-        added
+
+        // Cross-language semantic bridge: a backend SQL statement over table
+        // `users` links to frontend API calls touching `/api/users/...`.
+        // This is the headline feature — same-resource, different language.
+        for node_ids in by_resource.values() {
+            if node_ids.len() < 2 {
+                continue;
+            }
+            for &from in node_ids {
+                for &to in node_ids {
+                    connect(from, to, asg, &mut seen);
+                }
+            }
+        }
+
+        // Every entry in `seen` corresponds to exactly one pushed edge.
+        seen.len()
     }
+}
+
+/// Extract table names referenced by a SQL statement (`FROM x`, `JOIN x`,
+/// `INTO x`, `UPDATE x`), lowercased for case-insensitive matching.
+fn sql_tables(sql: &str) -> Vec<String> {
+    let mut tables = Vec::new();
+    let upper = sql.to_ascii_uppercase();
+    for keyword in ["FROM", "JOIN", "INTO", "UPDATE"] {
+        let mut search = 0usize;
+        while let Some(pos) = upper[search..].find(keyword) {
+            let after = search + pos + keyword.len();
+            let rest = &sql[after..];
+            let trimmed = rest.trim_start();
+            let skipped = rest.len() - trimmed.len();
+            // Identifier: letters, digits, underscore.
+            let ident: String = trimmed
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !ident.is_empty() {
+                tables.push(ident.to_lowercase());
+            }
+            search = after + skipped + ident.len();
+        }
+    }
+    tables.sort();
+    tables.dedup();
+    tables
+}
+
+/// Extract resource segments from an API path (`/api/users/42` -> `users`).
+/// Numeric and common verb segments are ignored.
+fn api_resources(path: &str) -> Vec<String> {
+    let mut resources = Vec::new();
+    for segment in path.split('/') {
+        if segment.is_empty()
+            || segment.chars().all(|c| c.is_ascii_digit())
+            || matches!(
+                segment,
+                "api" | "v1" | "v2" | "v3" | "get" | "post" | "put" | "delete" | "patch"
+            )
+        {
+            continue;
+        }
+        resources.push(segment.to_lowercase());
+    }
+    resources.sort();
+    resources.dedup();
+    resources
 }
 
 fn looks_like_sql(sql: &str) -> bool {

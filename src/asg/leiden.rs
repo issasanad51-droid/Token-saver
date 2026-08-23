@@ -295,12 +295,22 @@ pub fn detect_communities(asg: &Asg, config: &LeidenConfig) -> CommunityStructur
 
 /// Greedy local moving (Louvain phase). Visits nodes in id order until a full
 /// sweep makes no migration.
+///
+/// Community-link weights accumulate into a reusable dense scratch vector
+/// (reset via a touched list) instead of a fresh `HashMap` per node per
+/// sweep — the inner loop is the hot path of the whole partitioner.
 fn local_moving(graph: &WeightedGraph, resolution: f64) -> Vec<usize> {
     let n = graph.n;
     let mut community: Vec<usize> = (0..n).collect();
     let m2 = (2.0 * graph.total_edge_weight()).max(f64::MIN_POSITIVE);
     // Total degree per community (initially each node is its own community).
     let mut tot: Vec<f64> = graph.degree.clone();
+
+    // Scratch buffers hoisted out of the node loop: `links[c]` holds the
+    // weight from the current node into community `c` for every `c` listed
+    // in `touched`.
+    let mut links: Vec<f64> = vec![0.0; n];
+    let mut touched: Vec<usize> = Vec::new();
 
     let mut improved = true;
     while improved {
@@ -313,14 +323,19 @@ fn local_moving(graph: &WeightedGraph, resolution: f64) -> Vec<usize> {
             tot[old] -= k_i;
 
             // Weight of links from `node` into each neighboring community.
-            let mut links: HashMap<usize, f64> = HashMap::new();
+            debug_assert!(touched.is_empty());
             for &(neighbor, w) in &graph.adj[node] {
-                if neighbor != node {
-                    *links.entry(community[neighbor]).or_default() += w;
+                let c = community[neighbor];
+                if links[c] == 0.0 {
+                    touched.push(c);
                 }
+                links[c] += w;
             }
             if graph.self_loop[node] > 0.0 {
-                *links.entry(old).or_default() += graph.self_loop[node];
+                if links[old] == 0.0 {
+                    touched.push(old);
+                }
+                links[old] += graph.self_loop[node];
             }
 
             // Modularity gain of joining community C:
@@ -328,16 +343,20 @@ fn local_moving(graph: &WeightedGraph, resolution: f64) -> Vec<usize> {
             let mut best_community = old;
             let mut best_gain = f64::NEG_INFINITY;
             // Sorted keys keep tie-breaking deterministic.
-            let mut keys: Vec<usize> = links.keys().copied().collect();
-            keys.sort_unstable();
-            for c in keys {
-                let w = links[&c];
-                let gain = w - resolution * tot[c] * k_i / m2;
+            touched.sort_unstable();
+            for &c in &touched {
+                let gain = links[c] - resolution * tot[c] * k_i / m2;
                 if gain > best_gain + 1e-12 {
                     best_gain = gain;
                     best_community = c;
                 }
             }
+
+            // Reset the scratch buffers for the next node.
+            for &c in &touched {
+                links[c] = 0.0;
+            }
+            touched.clear();
 
             tot[best_community] += k_i;
             if best_community != old {
@@ -349,26 +368,66 @@ fn local_moving(graph: &WeightedGraph, resolution: f64) -> Vec<usize> {
     community
 }
 
-/// Leiden refinement: any node with zero internal degree (no edges to other
-/// members of its community) is split off as a singleton so every surviving
-/// community is internally connected.
+/// Leiden refinement: split every community into its **connected
+/// components** so each surviving community is internally connected.
+///
+/// This is the phase that distinguishes Leiden from Louvain. The previous
+/// implementation only split nodes with zero internal degree, which still
+/// allowed a community to hold two mutually unreachable fragments (A–B and
+/// C–D in the same community, every node with internal degree > 0). The
+/// component-based split guarantees the defining Leiden invariant.
+///
+/// Determinism: components are discovered in ascending seed order, so the
+/// fragment containing a community's lowest node id keeps the community's
+/// label and every later fragment gets a fresh label in discovery order.
 fn refine(graph: &WeightedGraph, community: &[usize]) -> Vec<usize> {
     let n = graph.n;
     let mut refined = community.to_vec();
     let mut next_label = community.iter().copied().max().unwrap_or(0) + 1;
 
-    for node in 0..n {
-        let c = refined[node];
-        let internal_degree: f64 = graph.adj[node]
-            .iter()
-            .filter(|&&(neighbor, _)| neighbor != node && refined[neighbor] == c)
-            .map(|(_, w)| w)
-            .sum();
-        if internal_degree <= 0.0 {
-            refined[node] = next_label;
+    // Has this community's label already been claimed by an earlier
+    // (lower-id) component? Index by community id; communities are dense
+    // `0..=max` after local moving starts from singletons.
+    let max_label = community.iter().copied().max().unwrap_or(0);
+    let mut label_claimed = vec![false; max_label + 1];
+    let mut visited = vec![false; n];
+    let mut queue: Vec<usize> = Vec::new();
+    let mut component: Vec<usize> = Vec::new();
+
+    for seed in 0..n {
+        if visited[seed] {
+            continue;
+        }
+        let c = community[seed];
+        visited[seed] = true;
+        queue.clear();
+        queue.push(seed);
+        component.clear();
+        while let Some(node) = queue.pop() {
+            component.push(node);
+            for &(neighbor, _) in &graph.adj[node] {
+                if !visited[neighbor] && community[neighbor] == c {
+                    visited[neighbor] = true;
+                    queue.push(neighbor);
+                }
+            }
+        }
+
+        let keeps_label = c <= max_label && !label_claimed[c];
+        if !keeps_label {
+            // This community label was already kept by an earlier component:
+            // the current fragment becomes a fresh community.
+            let fresh = next_label;
             next_label += 1;
+            for &node in &component {
+                refined[node] = fresh;
+            }
+        } else {
+            label_claimed[c] = true;
+            // Nodes already carry label `c`; nothing to write.
         }
     }
+
     refined
 }
 
@@ -534,6 +593,109 @@ mod tests {
     }
 
     #[test]
+    fn refine_splits_disconnected_community_into_components() {
+        // Two disconnected pairs (0-1 and 2-3) all assigned to ONE community.
+        // Every node has internal degree 1, so the old zero-internal-degree
+        // heuristic kept this community intact — violating the Leiden
+        // invariant. Component-based refinement must split it.
+        let edges = [(0, 1), (2, 3)];
+        let asg = asg_with(&edges);
+        let graph = WeightedGraph::from_asg(&asg);
+        let community = vec![7usize, 7, 7, 7];
+        let refined = refine(&graph, &community);
+
+        // First component (contains lowest node id 0) keeps the label.
+        assert_eq!(refined[0], 7);
+        assert_eq!(refined[1], 7);
+        // Second component becomes a fresh, distinct community.
+        assert_ne!(refined[2], 7);
+        assert_eq!(refined[2], refined[3]);
+    }
+
+    #[test]
+    fn refine_keeps_connected_community_whole() {
+        // A genuinely connected community (path 0-1-2-3 plus triangle
+        // 3-4-5, joined through node 3) survives refinement untouched.
+        let edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (3, 5)];
+        let asg = asg_with(&edges);
+        let graph = WeightedGraph::from_asg(&asg);
+        let community = vec![4usize, 4, 4, 4, 4, 4];
+        let refined = refine(&graph, &community);
+        assert_eq!(refined, community);
+    }
+
+    #[test]
+    fn refine_isolated_nodes_become_singletons() {
+        // Node 2 shares its community with a connected pair 0-1 but has no
+        // internal edges: it must be split off (old behaviour preserved).
+        // Built by hand because `asg_with` derives the node count from edge
+        // endpoints and would not create the isolated node at all.
+        let mut asg = Asg {
+            nodes: (0..3).map(node).collect(),
+            ..Asg::default()
+        };
+        asg.edges.push(Edge {
+            from: 0,
+            to: 1,
+            kind: EdgeKind::Calls,
+        });
+        let graph = WeightedGraph::from_asg(&asg);
+        let community = vec![5usize, 5, 5];
+        let refined = refine(&graph, &community);
+        assert_eq!(refined[0], 5);
+        assert_eq!(refined[1], 5);
+        assert_ne!(refined[2], 5);
+    }
+
+    #[test]
+    fn detect_communities_never_returns_disconnected_communities() {
+        // End-to-end invariant over a graph that tempts the greedy phase
+        // into bridge-joined clusters: hub 0 glues two triangles, and the
+        // far pair 6-7 is only reachable through 5.
+        let edges = [
+            (0, 1),
+            (1, 2),
+            (0, 2),
+            (0, 3),
+            (3, 4),
+            (4, 5),
+            (3, 5),
+            (5, 6),
+            (6, 7),
+        ];
+        let asg = asg_with(&edges);
+        let structure = detect_communities(&asg, &LeidenConfig::default());
+
+        // Verify the defining Leiden guarantee: every community induces a
+        // connected subgraph.
+        let graph = WeightedGraph::from_asg(&asg);
+        for community in 0..structure.community_count {
+            let members = structure.members(community);
+            if members.len() < 2 {
+                continue;
+            }
+            let mut reachable = vec![members[0]];
+            let mut frontier = vec![members[0]];
+            while let Some(node) = frontier.pop() {
+                for &(neighbor, _) in &graph.adj[node] {
+                    if members.contains(&neighbor)
+                        && !reachable.contains(&neighbor)
+                    {
+                        reachable.push(neighbor);
+                        frontier.push(neighbor);
+                    }
+                }
+            }
+            assert_eq!(
+                reachable.len(),
+                members.len(),
+                "community {community} is internally disconnected: {:?}",
+                members
+            );
+        }
+    }
+
+    #[test]
     fn deterministic_partition() {
         let edges = [(0, 1), (1, 2), (2, 0), (2, 3), (3, 4), (4, 3)];
         let asg = asg_with(&edges);
@@ -572,22 +734,21 @@ mod tests {
         assert_ne!(adjacent, far);
 
         let scores = structure.proximity_scores(&asg, seed);
-        for node in 0..3 {
-            assert_eq!(scores[node], 1.0, "seed member {node}");
+        for (node, &score) in scores.iter().enumerate().take(3) {
+            assert_eq!(score, 1.0, "seed member {node}");
         }
-        for node in 3..6 {
-            let s = scores[node];
+        for (node, &score) in scores.iter().enumerate().skip(3).take(3) {
             assert!(
-                s > 0.0 && s < 1.0,
-                "adjacent member {node} must get partial credit strictly below 1.0, got {s}"
+                score > 0.0 && score < 1.0,
+                "adjacent member {node} must get partial credit strictly below 1.0, got {score}"
             );
             assert!(
-                s <= ADJACENT_COMMUNITY_MAX,
-                "adjacent member {node} must respect the cap, got {s}"
+                score <= ADJACENT_COMMUNITY_MAX,
+                "adjacent member {node} must respect the cap, got {score}"
             );
         }
-        for node in 6..9 {
-            assert_eq!(scores[node], 0.0, "non-adjacent member {node}");
+        for (node, &score) in scores.iter().enumerate().skip(6).take(3) {
+            assert_eq!(score, 0.0, "non-adjacent member {node}");
         }
     }
 

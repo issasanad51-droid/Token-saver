@@ -32,11 +32,12 @@ use tree_sitter::{Node as TsNode, Parser};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PruneConfig {
-    /// PageRank percentile threshold (0.0–1.0). Nodes whose normalized PPR
-    /// score falls at or below this percentile are pruned to signatures.
+    /// Relevance percentile threshold (0.0–1.0) within the delivered
+    /// dependency set. Dependencies whose fused-relevance rank falls at or
+    /// below this percentile are pruned to signatures.
     ///
-    /// Example: 0.7 means the top-30% of dependencies keep their full body;
-    /// the bottom 70% are collapsed to signatures.
+    /// Example: `0.7` means the top-30% of delivered dependencies keep
+    /// their full body; the bottom 70% are collapsed to signatures.
     pub keep_threshold: f64,
     /// Enable/disable pruning entirely (useful for debugging or when the
     /// token budget is generous).
@@ -46,7 +47,12 @@ pub struct PruneConfig {
 impl Default for PruneConfig {
     fn default() -> Self {
         Self {
-            keep_threshold: 0.30,
+            // Top-30% of the delivered set keep full bodies — matches the
+            // documented semantics above. (The previous default of 0.30
+            // inverted the intent: it kept the top 70% full, which made the
+            // signature-pruning stage almost a no-op and blew the token
+            // budget the e2e reduction test guards.)
+            keep_threshold: 0.70,
             enabled: true,
         }
     }

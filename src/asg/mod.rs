@@ -395,8 +395,105 @@ impl PageRankEngine {
     }
 
     /// Compute weighted PPR without mutating the graph.
+    ///
+    /// Convenience wrapper: builds a one-shot [`PprIndex`] and runs the
+    /// iteration on it. Callers on the query hot path should build the index
+    /// once (per graph snapshot) and call [`Self::personalized_scores_on`]
+    /// instead.
     pub fn personalized_scores(&self, asg: &Asg, seeds: &[(usize, f64)]) -> Vec<f64> {
+        let index = PprIndex::build(asg, &self.config.edge_weights);
+        self.personalized_scores_on(&index, seeds)
+    }
+}
+
+/// Precomputed weighted adjacency for repeated PPR queries over a fixed
+/// graph snapshot, stored in flat CSR form.
+///
+/// Building the adjacency is O(E) with one `Vec<Vec<_>>` worth of
+/// allocations. Doing that on *every* query (the autocomplete hot path)
+/// wasted both the allocation churn and the cache-hostile scatter of
+/// nested vectors; `PprIndex` is built once per graph snapshot and shared
+/// across queries, so each query becomes a pure numeric sweep over frozen
+/// arrays.
+#[derive(Debug, Clone, Default)]
+pub struct PprIndex {
+    node_count: usize,
+    /// Flat CSR adjacency: targets of each node's out-edges.
+    targets: Vec<usize>,
+    /// Edge weights, parallel to `targets`.
+    weights: Vec<f64>,
+    /// `offsets[node]..offsets[node + 1]` slices this node's out-edges.
+    offsets: Vec<usize>,
+    /// Total weighted out-degree per node (0 = dangling node).
+    out_weight: Vec<f64>,
+}
+
+impl PprIndex {
+    /// Snapshot the weighted adjacency of `asg` under `weights`.
+    pub fn build(asg: &Asg, weights: &PageRankEdgeWeights) -> Self {
         let node_count = asg.nodes.len();
+        let mut targets = Vec::with_capacity(asg.edges.len());
+        let mut weights_out = Vec::with_capacity(asg.edges.len());
+        let mut out_weight = vec![0.0f64; node_count];
+
+        // Bucket edges by source with a counting pass so the flat arrays are
+        // ordered by node id without per-node allocations.
+        let mut counts = vec![0usize; node_count + 1];
+        for edge in &asg.edges {
+            if edge.from >= node_count
+                || edge.to >= node_count
+                || edge.from == edge.to
+                || weights.for_kind(edge.kind) <= 0.0
+            {
+                continue;
+            }
+            counts[edge.from + 1] += 1;
+        }
+        let mut running = 0usize;
+        for slot in counts.iter_mut() {
+            running += *slot;
+            *slot = running;
+        }
+        targets.resize(counts[node_count], 0);
+        weights_out.resize(counts[node_count], 0.0);
+        let mut cursor = counts.clone();
+        for edge in &asg.edges {
+            if edge.from >= node_count
+                || edge.to >= node_count
+                || edge.from == edge.to
+                || weights.for_kind(edge.kind) <= 0.0
+            {
+                continue;
+            }
+            let weight = weights.for_kind(edge.kind);
+            let slot = cursor[edge.from];
+            targets[slot] = edge.to;
+            weights_out[slot] = weight;
+            out_weight[edge.from] += weight;
+            cursor[edge.from] += 1;
+        }
+        let offsets = counts;
+
+        Self {
+            node_count,
+            targets,
+            weights: weights_out,
+            offsets,
+            out_weight,
+        }
+    }
+}
+
+impl PageRankEngine {
+    /// Compute weighted PPR over a precomputed [`PprIndex`] without
+    /// rebuilding the adjacency. The seeds are `(node id, weight)` pairs;
+    /// they are normalized into the teleport vector internally.
+    ///
+    /// The iteration indexes several parallel dense buffers by node id;
+    /// iterator plumbing would obscure the numeric kernel.
+    #[allow(clippy::needless_range_loop)]
+    pub fn personalized_scores_on(&self, index: &PprIndex, seeds: &[(usize, f64)]) -> Vec<f64> {
+        let node_count = index.node_count;
         if node_count == 0 {
             return Vec::new();
         }
@@ -414,19 +511,6 @@ impl PageRankEngine {
             }
         } else {
             teleport.fill(1.0 / node_count as f64);
-        }
-
-        let mut outgoing: Vec<Vec<(usize, f64)>> = vec![Vec::new(); node_count];
-        let mut out_weight = vec![0.0; node_count];
-        for edge in &asg.edges {
-            if edge.from >= node_count || edge.to >= node_count || edge.from == edge.to {
-                continue;
-            }
-            let weight = self.config.edge_weights.for_kind(edge.kind);
-            if weight > 0.0 {
-                outgoing[edge.from].push((edge.to, weight));
-                out_weight[edge.from] += weight;
-            }
         }
 
         let damping = if self.config.damping.is_finite() {
@@ -448,18 +532,19 @@ impl PageRankEngine {
             let mut dangling_mass = 0.0;
 
             for from in 0..node_count {
-                if out_weight[from] == 0.0 {
+                let out = index.out_weight[from];
+                if out == 0.0 {
                     dangling_mass += damping * rank[from];
                     continue;
                 }
-                let scale = damping * rank[from] / out_weight[from];
-                for &(to, weight) in &outgoing[from] {
-                    next[to] += scale * weight;
+                let scale = damping * rank[from] / out;
+                for slot in index.offsets[from]..index.offsets[from + 1] {
+                    next[index.targets[slot]] += scale * index.weights[slot];
                 }
             }
 
-            for index in 0..node_count {
-                next[index] += ((1.0 - damping) + dangling_mass) * teleport[index];
+            for value in 0..node_count {
+                next[value] += ((1.0 - damping) + dangling_mass) * teleport[value];
             }
 
             let difference: f64 = rank
@@ -659,6 +744,52 @@ impl SharedAsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ppr_index_matches_oneshot_path() {
+        // The cached CSR index must produce byte-identical scores to the
+        // one-shot adjacency rebuild it replaced.
+        let asg = Asg {
+            nodes: (0..8).map(|i| node(i, &format!("n{i}"))).collect(),
+            edges: vec![
+                Edge { from: 0, to: 1, kind: EdgeKind::Calls },
+                Edge { from: 0, to: 2, kind: EdgeKind::References },
+                Edge { from: 1, to: 3, kind: EdgeKind::Calls },
+                Edge { from: 2, to: 3, kind: EdgeKind::Implements },
+                Edge { from: 3, to: 0, kind: EdgeKind::Calls },
+                Edge { from: 4, to: 5, kind: EdgeKind::Contains },
+                Edge { from: 5, to: 6, kind: EdgeKind::Contains },
+                Edge { from: 6, to: 4, kind: EdgeKind::Contains },
+                Edge { from: 7, to: 7, kind: EdgeKind::Calls }, // self-loop: skipped
+                Edge { from: 9, to: 1, kind: EdgeKind::Calls }, // out-of-range: skipped
+            ],
+            ..Asg::default()
+        };
+        let engine = PageRankEngine::default();
+        let index = PprIndex::build(&asg, &engine.config.edge_weights);
+        for seeds in [
+            vec![(0usize, 1.0f64)],
+            vec![(3, 1.0), (4, 2.0)],
+            Vec::new(), // uniform teleport fallback
+        ] {
+            let via_index = engine.personalized_scores_on(&index, &seeds);
+            let via_graph = engine.personalized_scores(&asg, &seeds);
+            assert_eq!(via_index.len(), via_graph.len());
+            for (a, b) in via_index.iter().zip(&via_graph) {
+                assert!(
+                    (a - b).abs() < 1e-12,
+                    "scores differ: index={a} graph={b} seeds={seeds:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ppr_index_empty_graph_is_safe() {
+        let engine = PageRankEngine::default();
+        let index = PprIndex::build(&Asg::default(), &engine.config.edge_weights);
+        assert!(engine.personalized_scores_on(&index, &[(0, 1.0)]).is_empty());
+    }
 
     fn node(id: usize, name: &str) -> Node {
         Node {

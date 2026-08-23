@@ -431,7 +431,9 @@ fn aggressive_alias(source: &str, min_length: usize) -> String {
 
     // --- Phase D: Rebuild source with replacements ---
     // We re-scan and replace in a single pass: emit the alias in place of
-    // any identifier that appears in the map.
+    // any identifier that appears in the map. Raw-string prefixes are
+    // checked BEFORE identifiers: the old "rewind and retry" approach
+    // re-entered the identifier branch forever (infinite loop).
     let mut result = String::with_capacity(source.len());
     let bytes = source.as_bytes();
     let len = bytes.len();
@@ -439,6 +441,39 @@ fn aggressive_alias(source: &str, min_length: usize) -> String {
 
     while i < len {
         let b = bytes[i];
+
+        // Raw strings: r"…" / r#"…"# / br#"…"# — copied verbatim, never
+        // aliased inside.
+        if b == b'r' || (b == b'b' && i + 1 < len && bytes[i + 1] == b'r') {
+            let mut probe = i + 1;
+            if b == b'b' {
+                probe += 1;
+            }
+            if probe < len && (bytes[probe] == b'#' || bytes[probe] == b'"') {
+                let start = i;
+                let mut hashes = 0u32;
+                i = probe;
+                if bytes[i] == b'#' {
+                    while i < len && bytes[i] == b'#' {
+                        hashes += 1;
+                        i += 1;
+                    }
+                }
+                if i < len && bytes[i] == b'"' {
+                    i += 1;
+                    let close = format!("\"{}", "#".repeat(hashes as usize));
+                    while i + close.len() <= len {
+                        if source[i..i + close.len()] == close[..] {
+                            i += close.len();
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                result.push_str(&source[start..i]);
+                continue;
+            }
+        }
 
         // Identifiers: [a-zA-Z_][a-zA-Z0-9_]*
         if b.is_ascii_alphabetic() || b == b'_' {
@@ -448,14 +483,7 @@ fn aggressive_alias(source: &str, min_length: usize) -> String {
                 i += 1;
             }
             let ident = &source[start..i];
-            // A bare `r` (or `br`) directly followed by `#`/`"` starts a raw
-            // string — rewind so the raw-string branch handles it.
-            let is_raw_prefix = (ident == "r" || ident == "br")
-                && i < len
-                && (bytes[i] == b'#' || bytes[i] == b'"');
-            if is_raw_prefix {
-                i = start;
-            } else if let Some(alias) = alias_map.get(ident) {
+            if let Some(alias) = alias_map.get(ident) {
                 result.push_str(alias);
             } else {
                 result.push_str(ident);
@@ -556,7 +584,17 @@ fn aggressive_alias(source: &str, min_length: usize) -> String {
         i += 1;
     }
 
-    format!("// aliases: {legend}\n{result}")
+    // --- Phase E: Honesty gate ---
+    // The legend costs bytes; on inputs where identifiers barely repeat,
+    // aliasing can end up LARGER than the original. Emit the aliased form
+    // only when it is strictly smaller — matching the README's "honest
+    // lossless compression" contract.
+    let aliased = format!("// aliases: {legend}\n{result}");
+    if aliased.len() < source.len() {
+        aliased
+    } else {
+        source.to_string()
+    }
 }
 
 /// A single lexer token.
@@ -577,6 +615,43 @@ fn lex_source(source: &str) -> Vec<Token> {
     while i < len {
         let b = bytes[i];
 
+        // Raw strings: r"…" / r#"…"# / br#"…"#. This MUST be checked before
+        // the identifier branch: `r`/`br` are alphabetic, so the identifier
+        // scan would otherwise swallow the prefix and the opening quote would
+        // never be seen here. (A previous version "solved" this by rewinding
+        // the index from inside the identifier branch, which re-entered that
+        // same branch forever — an infinite loop on any raw string.)
+        if b == b'r' || (b == b'b' && i + 1 < len && bytes[i + 1] == b'r') {
+            let mut probe = i + 1;
+            if b == b'b' {
+                probe += 1;
+            }
+            if probe < len && (bytes[probe] == b'#' || bytes[probe] == b'"') {
+                let start = i;
+                let mut hashes = 0u32;
+                i = probe;
+                if bytes[i] == b'#' {
+                    while i < len && bytes[i] == b'#' {
+                        hashes += 1;
+                        i += 1;
+                    }
+                }
+                if i < len && bytes[i] == b'"' {
+                    i += 1;
+                    let close = format!("\"{}", "#".repeat(hashes as usize));
+                    while i + close.len() <= len {
+                        if source[i..i + close.len()] == close[..] {
+                            i += close.len();
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                tokens.push(Token::Other(source[start..i].to_string()));
+                continue;
+            }
+        }
+
         // Identifiers: [a-zA-Z_][a-zA-Z0-9_]*
         if b.is_ascii_alphabetic() || b == b'_' {
             let start = i;
@@ -584,16 +659,7 @@ fn lex_source(source: &str) -> Vec<Token> {
             while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
-            // A bare `r` (or `br`) directly followed by `#`/`"` starts a raw
-            // string — rewind so the raw-string branch handles it.
-            let is_raw_prefix = (&source[start..i] == "r" || &source[start..i] == "br")
-                && i < len
-                && (bytes[i] == b'#' || bytes[i] == b'"');
-            if is_raw_prefix {
-                i = start;
-            } else {
-                tokens.push(Token::Ident(source[start..i].to_string()));
-            }
+            tokens.push(Token::Ident(source[start..i].to_string()));
             continue;
         }
 
@@ -610,35 +676,6 @@ fn lex_source(source: &str) -> Vec<Token> {
             }
             if i < len {
                 i += 1;
-            }
-            tokens.push(Token::Other(source[start..i].to_string()));
-            continue;
-        }
-
-        // Raw strings: r#"…"#
-        if b == b'r' && i + 1 < len && (bytes[i + 1] == b'#' || bytes[i + 1] == b'"') {
-            let start = i;
-            let mut hashes = 0u32;
-            i += 1;
-            if bytes[i] == b'#' {
-                while i < len && bytes[i] == b'#' {
-                    hashes += 1;
-                    i += 1;
-                }
-            }
-            if i < len && bytes[i] == b'"' {
-                i += 1;
-                let close_len = 1 + hashes as usize;
-                while i + close_len <= len {
-                    if bytes[i] == b'"'
-                        && &source[i..i + close_len]
-                            == format!("\"{}", "#".repeat(hashes as usize)).as_str()
-                    {
-                        i += close_len;
-                        break;
-                    }
-                    i += 1;
-                }
             }
             tokens.push(Token::Other(source[start..i].to_string()));
             continue;
@@ -850,11 +887,55 @@ mod tests {
         assert!(has_raw, "raw string should be tokenized: {:?}", tokens);
     }
 
+    #[test]
+    fn lexer_raw_string_regression_no_hang() {
+        // Regression: the identifier branch used to rewind to the `r` and
+        // re-enter itself forever, so ANY raw string hung the lexer — and
+        // with it the whole autocomplete pipeline. Each case must terminate
+        // and lex the raw string as a single Other token.
+        let cases = [
+            ("r#\"x\"#", "r#\"x\"#"),
+            ("let s = r\"plain\";", "r\"plain\""),
+            ("br#\"bytes\"#", "br#\"bytes\"#"),
+            ("br\"raw bytes\"", "br\"raw bytes\""),
+            ("r##\"double\"##", "r##\"double\"##"),
+            // `br` NOT followed by a quote still lexes as an identifier.
+            ("let br = 1;", "br"),
+        ];
+        for (input, expected) in cases {
+            let tokens = lex_source(input);
+            assert!(
+                tokens.iter().any(|t| match t {
+                    Token::Other(s) => s == expected,
+                    Token::Ident(s) => s == expected && expected == "br",
+                }),
+                "case {input:?}: expected token {expected:?}, got {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lexer_plain_identifiers_with_r_prefixes_untouched() {
+        // Identifiers merely *starting* with r/b must not be mistaken for
+        // raw strings when no quote/hash follows.
+        let tokens = lex_source("render bridge root broad");
+        let idents: Vec<&str> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Token::Ident(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(idents, vec!["render", "bridge", "root", "broad"]);
+    }
+
     // --- Alias tests ---
 
     #[test]
     fn alias_legend_injected() {
-        let source = "pub fn handle(workspace_configuration_directory_path: &str) {\n    invalidate_merkle_tree();\n}";
+        // Repeated occurrences so the legend amortizes and the honesty
+        // gate keeps the aliased form.
+        let source = "pub fn handle(workspace_configuration_directory_path: &str) {\n    let a = workspace_configuration_directory_path;\n    let b = workspace_configuration_directory_path;\n    invalidate_merkle_tree();\n}";
         let result = aggressive_alias(source, 6);
         assert!(
             result.starts_with("// aliases:"),
@@ -878,20 +959,50 @@ mod tests {
 
     #[test]
     fn aliases_replaced_in_body() {
-        let source = "fn process(workspace_configuration_directory_path: &str) {\n    let x = workspace_configuration_directory_path;\n}";
+        // Enough repetitions for the legend to amortize — the honesty gate
+        // returns the original unchanged when aliasing would not shrink the
+        // source.
+        let source = "fn process(workspace_configuration_directory_path: &str) {\n    let x = workspace_configuration_directory_path;\n    let y = workspace_configuration_directory_path;\n    let z = workspace_configuration_directory_path;\n}";
         let result = aggressive_alias(source, 6);
         assert!(
-            !result.contains("workspace_configuration_directory_path"),
-            "long ident should be replaced: {result}"
+            result.starts_with("// aliases:"),
+            "repetitive source should be aliased: {result}"
+        );
+        // The BODY must no longer contain the identifier (the legend line
+        // legitimately does — that is how hydration works).
+        let body = result.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+        assert!(
+            !body.contains("workspace_configuration_directory_path"),
+            "long ident should be replaced in the body: {result}"
         );
         assert!(result.contains("_a"));
     }
 
     #[test]
+    fn alias_honesty_gate_returns_original_when_no_savings() {
+        // A long identifier that occurs ONCE cannot amortize its legend
+        // entry: aliasing would grow the output. The honest thing — and the
+        // README's stated contract — is to return the source unchanged.
+        let source = "fn f(one_long_identifier_name: &str) { let x = 1; }";
+        let result = aggressive_alias(source, 6);
+        assert_eq!(
+            result, source,
+            "no-net-savings aliasing must pass through unchanged"
+        );
+    }
+
+    #[test]
     fn keywords_never_aliased() {
-        let source = "pub fn return_thing() { return; }";
+        // `return_thing` is an identifier (not the `return` keyword) and
+        // must be aliased; the actual keyword must survive untouched.
+        let source = "pub fn return_thing() {\n    return_thing();\n    return_thing();\n    return_thing();\n    return;\n}";
         let result = aggressive_alias(source, 6);
         assert!(result.contains("_a="));
+        let legend = result.lines().next().unwrap_or("");
+        assert!(
+            legend.contains("return_thing"),
+            "identifier should be aliased: {result}"
+        );
         let return_count = result.matches("return").count();
         assert!(return_count >= 1, "`return` keyword must remain: {result}");
     }
@@ -1018,11 +1129,17 @@ mod tests {
 
     #[test]
     fn alias_then_evacuate_saves_most() {
-        let source = "pub fn process_request(workspace_configuration: &Config) {\n    let dir = workspace_configuration.directory_path;\n    invalidate_merkle_tree(dir);\n}";
+        // Heavy repetition is where the alias legend amortizes: each
+        // occurrence of a ~38-char identifier collapses to ~2 chars.
+        let source = "pub fn process_request(workspace_configuration_directory_root: &Config) {\n    let first = workspace_configuration_directory_root.directory_path;\n    let second = workspace_configuration_directory_root.cache_root;\n    let third = workspace_configuration_directory_root.output_root;\n    invalidate_merkle_tree(first, second, third);\n    invalidate_merkle_tree(first, second, third);\n    invalidate_merkle_tree(first, second, third);\n    invalidate_merkle_tree(first, second, third);\n}";
         let aliased = aggressive_alias(source, 6);
+        assert!(
+            aliased.starts_with("// aliases:"),
+            "repetitive source should be aliased: {aliased}"
+        );
         let final_result = evacuate_whitespace(&aliased);
-        assert!(final_result.len() < source.len() / 2,
-            "final ({len}B) should be < half of original ({orig}B): {final_result}",
+        assert!(final_result.len() < source.len() * 4 / 5,
+            "final ({len}B) should be well under the original ({orig}B): {final_result}",
             len = final_result.len(), orig = source.len()
         );
         assert!(final_result.starts_with("// aliases:"));

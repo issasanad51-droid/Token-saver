@@ -126,7 +126,18 @@ impl DiffGenerator {
             result.push(original_lines[old_pos].to_string());
             old_pos += 1;
         }
-        Ok(result.join("\n"))
+
+        // Preserve the original's trailing-newline convention. `str::lines()`
+        // drops that information, so without this a file ending in "\n"
+        // silently loses its final newline through a diff round-trip. (A
+        // diff that *changes* the convention cannot be represented without
+        // git's "\ No newline at end of file" markers, which this compact
+        // format intentionally omits.)
+        let mut applied = result.join("\n");
+        if original.ends_with('\n') {
+            applied.push('\n');
+        }
+        Ok(applied)
     }
 }
 
@@ -183,8 +194,13 @@ fn lcs_ops(a: &[&str], b: &[&str]) -> Vec<(Op, usize, usize)> {
 
 fn group_hunks(ops: &[(Op, usize, usize)], context: usize) -> Vec<Hunk> {
     let n = ops.len();
-    let mut hunks = Vec::new();
+    let mut hunks: Vec<Hunk> = Vec::new();
     let mut i = 0;
+    // Ops window [start, end) of the last emitted hunk. When two changes
+    // sit closer together than 2 × context, their context windows overlap;
+    // the hunks must merge, otherwise both hunks contain the shared context
+    // lines and `apply_diff` consumes them twice (ContextMismatch).
+    let mut last: Option<(usize, usize)> = None;
     while i < n {
         if ops[i].0 == Op::Equal {
             i += 1;
@@ -198,12 +214,28 @@ fn group_hunks(ops: &[(Op, usize, usize)], context: usize) -> Vec<Hunk> {
         let change_end = j;
         let start = change_start.saturating_sub(context);
         let end = (change_end + context).min(n);
+
+        if let Some((prev_start, prev_end)) = last {
+            if start < prev_end {
+                // Overlapping context windows: extend the previous hunk to
+                // swallow this change instead of emitting a second hunk.
+                let merged_end = end.max(prev_end);
+                let hunk = hunks.last_mut().expect("last window implies a hunk");
+                hunk.ops = ops[prev_start..merged_end].to_vec();
+                last = Some((prev_start, merged_end));
+                i = merged_end;
+                continue;
+            }
+        }
+
         let (_, oi, bi) = ops[start];
-        let (old_start, new_start) = (oi + 1, bi + 1);        hunks.push(Hunk {
+        let (old_start, new_start) = (oi + 1, bi + 1);
+        hunks.push(Hunk {
             old_start,
             new_start,
             ops: ops[start..end].to_vec(),
         });
+        last = Some((start, end));
         i = end;
     }
     hunks

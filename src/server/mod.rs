@@ -469,11 +469,7 @@ pub async fn autocomplete_handler(
                 }
                 if tx
                     .send(CompletionChunk {
-                        text: format!(
-                            "// --- Compressed Dependency {} ---\n{}\n",
-                            index + 1,
-                            dependency
-                        ),
+                        text: format!("// dep {}\n{}\n", index + 1, dependency),
                         done: false,
                         node_id,
                         pagerank,

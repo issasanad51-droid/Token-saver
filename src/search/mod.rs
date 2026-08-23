@@ -35,7 +35,7 @@ use tree_sitter::{Node as TsNode, Parser};
 
 use crate::asg::{
     leiden::{detect_communities, CommunityStructure, LeidenConfig},
-    EdgeKind, Node, PageRankEngine, PersonalizedPageRankConfig, SharedAsg,
+    EdgeKind, Node, PageRankEngine, PersonalizedPageRankConfig, PprIndex, SharedAsg,
 };
 use crate::compressor::ChunkRegistry;
 use crate::recency::RecencyTracker;
@@ -393,6 +393,10 @@ pub struct SearchEngine {
     embedder: Arc<RwLock<Option<fastembed::TextEmbedding>>>,
     /// Stream D: Leiden community assignment over the workspace.
     communities: Arc<AsyncRwLock<Option<CommunityStructure>>>,
+    /// Stream C: precomputed PPR adjacency for the current graph snapshot.
+    /// Built once per (re)index instead of per query — the old path rebuilt
+    /// the full O(E) adjacency on every keystroke.
+    ppr_index: Arc<RwLock<PprIndex>>,
     /// Sliding-window recency tracker that boosts recently touched nodes in
     /// the PPR teleport vector.
     recency: Arc<RecencyTracker>,
@@ -404,6 +408,7 @@ impl SearchEngine {
     }
 
     pub fn with_config(asg: SharedAsg, registry: ChunkRegistry, config: SearchConfig) -> Self {
+        let ppr_index = PprIndex::build(&asg.inner, &config.ppr.edge_weights);
         Self {
             asg,
             registry: Arc::new(registry),
@@ -412,6 +417,7 @@ impl SearchEngine {
             embeddings: Arc::new(AsyncRwLock::new(HashMap::new())),
             embedder: Arc::new(RwLock::new(None)),
             communities: Arc::new(AsyncRwLock::new(None)),
+            ppr_index: Arc::new(RwLock::new(ppr_index)),
             recency: Arc::new(RecencyTracker::new()),
         }
     }
@@ -518,6 +524,12 @@ impl SearchEngine {
             community_count: 0,
         });
         *self.communities.write().await = Some(structure);
+
+        // Refresh the cached PPR adjacency so Stream C matches the same
+        // graph snapshot the lexical index, embeddings, and communities
+        // were just built from.
+        *self.ppr_index.write().unwrap() =
+            PprIndex::build(&self.asg.inner, &self.config.ppr.edge_weights);
     }
 
     /// Search without editor context.
@@ -571,11 +583,11 @@ impl SearchEngine {
 
         // ---- Stream C: PPR teleported from query candidates + cursor ------
         let seeds = self.ppr_seeds(&lexical, &semantic, context_node);
-        let ppr_asg = self.asg.clone();
         let ppr_registry = self.registry.clone();
         let ppr_config = self.config.ppr.clone();
+        let ppr_index = self.ppr_index.clone();
         let structural = tokio::task::spawn_blocking(move || {
-            Self::structural_search(ppr_asg, ppr_registry, ppr_config, seeds, pool_size)
+            Self::structural_search(ppr_index, ppr_registry, ppr_config, seeds, pool_size)
         })
         .await
         .unwrap_or_default();
@@ -666,14 +678,15 @@ impl SearchEngine {
     }
 
     fn structural_search(
-        asg: SharedAsg,
+        ppr_index: Arc<RwLock<PprIndex>>,
         registry: Arc<ChunkRegistry>,
         config: PersonalizedPageRankConfig,
         seeds: Vec<(usize, f64)>,
         top_k: usize,
     ) -> Vec<SearchResult> {
         let engine = PageRankEngine::from_config(config);
-        let scores = engine.personalized_scores(&asg.inner, &seeds);
+        let index = ppr_index.read().unwrap();
+        let scores = engine.personalized_scores_on(&index, &seeds);
 
         let mut results: Vec<SearchResult> = scores
             .into_iter()

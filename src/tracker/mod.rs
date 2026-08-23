@@ -190,7 +190,10 @@ impl ContextTracker {
             .search_with_context(query, candidate_count, cursor_node)
             .await;
 
-        // Phase 1: Collect all candidate chunks with their PPR scores.
+        // Phase 1: Collect candidate chunks with their fused relevance
+        // scores (RRF). The query-relative rank drives every downstream
+        // decision — pruning tiers and the top-N selection — because global
+        // PageRank says nothing about what THIS query needs.
         let mut candidates: Vec<(usize, f64, String)> = Vec::new();
         for result in &results {
             if Some(result.node_id) == cursor_node {
@@ -200,20 +203,26 @@ impl ContextTracker {
                 continue;
             };
             let prompt_text = chunk.prompt_text();
-            let pagerank = self
-                .asg
-                .get_node(result.node_id)
-                .map(|n| n.pagerank)
-                .unwrap_or(0.0);
-            candidates.push((result.node_id, pagerank, prompt_text));
+            candidates.push((result.node_id, result.rrf_score, prompt_text));
         }
 
-        // Phase 2: AST signature pruning — low-rank dependencies are
-        // collapsed to declarations only, saving ~80% tokens.
-        let pruned = crate::ast::prune_batch(candidates, &self.config.prune);
+        // Phase 2: Relevance-based selection. The top-N cut MUST happen
+        // here, BEFORE the alphabetical prompt-cache sort in Phase 4 —
+        // after that sort, taking the first N would silently select the
+        // alphabetically-first dependencies instead of the most relevant
+        // ones (which is how `multiply` got dropped for `divide`).
+        let mut selected = candidates;
+        selected.sort_by(|a, b| b.1.total_cmp(&a.1));
+        selected.truncate(self.config.max_dependencies);
 
-        // Phase 3: Post-processing pipeline — alias, whitespace-evacuate,
-        // monomorphize, and deterministically sort.
+        // Phase 3: AST signature pruning — within the DELIVERED set, only
+        // the top-relevance dependencies keep full bodies; the rest are
+        // collapsed to declarations only, saving ~80% of their tokens.
+        let pruned = crate::ast::prune_batch(selected, &self.config.prune);
+
+        // Phase 4: Post-processing pipeline — alias, whitespace-evacuate,
+        // monomorphize, and deterministically sort (stable order for
+        // prompt-cache reuse; applies to the already-selected set).
         let processed = crate::ast::postprocess(
             pruned,
             &self.config.postprocess,
@@ -221,20 +230,13 @@ impl ContextTracker {
             cursor_node,
         );
 
-        // Phase 4: Pack greedily under the token budget.
-        let mut compressed = Vec::new();
-        let mut used_tokens = 0usize;
-        for dep in processed {
-            if used_tokens + dep.tokens > self.config.dependency_token_budget {
-                continue;
-            }
-            used_tokens += dep.tokens;
-            compressed.push(dep.text);
-            if compressed.len() >= self.config.max_dependencies {
-                break;
-            }
-        }
-        compressed
+        // Phase 4: Deduplicate identical bodies, then pack greedily under
+        // the token budget (see [`pack_dependencies`]).
+        pack_dependencies(
+            processed,
+            self.config.dependency_token_budget,
+            self.config.max_dependencies,
+        )
     }
 
     /// Assemble a complete prompt and enforce the overall context cap.
@@ -245,11 +247,9 @@ impl ContextTracker {
 
         let dependencies = self.get_compressed_dependencies(payload, query).await;
         for (index, dependency) in dependencies.into_iter().enumerate() {
-            let section = format!(
-                "\n\n--- COMPRESSED DEPENDENCY {} ---\n{}",
-                index + 1,
-                dependency
-            );
+            // Minimal delimiter: verbose section headers burn ~6 tokens per
+            // dependency while carrying almost no signal for the model.
+            let section = format!("\n\n// dep {}\n{}", index + 1, dependency);
             let section_tokens = estimate_tokens(&section);
             if used_tokens + section_tokens > self.config.max_context_tokens {
                 break;
@@ -308,6 +308,40 @@ pub fn estimate_tokens(text: &str) -> usize {
 // Serializable context snapshot
 // ---------------------------------------------------------------------------
 
+/// Pack processed dependencies under the token budget, **skipping identical
+/// bodies**.
+///
+/// Distinct ASG nodes can carry byte-identical source (boilerplate builders,
+/// mirrored impls, generated code). Ranking treats them as separate
+/// candidates, but emitting the same text twice only burns tokens — the
+/// model gains nothing from the second copy. The first occurrence in the
+/// deterministic packing order wins; later duplicates are dropped before
+/// the budget arithmetic so the freed budget can carry a *new* dependency.
+pub(crate) fn pack_dependencies(
+    processed: Vec<crate::ast::postprocess::ProcessedDep>,
+    token_budget: usize,
+    max_dependencies: usize,
+) -> Vec<String> {
+    let mut seen_bodies: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut compressed = Vec::new();
+    let mut used_tokens = 0usize;
+    for dep in processed {
+        if seen_bodies.contains(&dep.text) {
+            continue;
+        }
+        seen_bodies.insert(dep.text.clone());
+        if used_tokens + dep.tokens > token_budget {
+            continue;
+        }
+        used_tokens += dep.tokens;
+        compressed.push(dep.text);
+        if compressed.len() >= max_dependencies {
+            break;
+        }
+    }
+    compressed
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextSnapshot {
     pub cursor: CursorPayload,
@@ -341,6 +375,58 @@ impl ContextSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::postprocess::ProcessedDep;
+
+    #[test]
+    fn pack_dependencies_dedups_identical_bodies() {
+        // Distinct nodes with byte-identical bodies (mirrored builders,
+        // generated boilerplate) must be emitted once — the second copy
+        // costs tokens and adds zero information for the model.
+        let deps = vec![
+            ProcessedDep {
+                module_path: "crate::a::fn::with_crate_root".to_string(),
+                text: "pub fn with_crate_root(mut self, root: impl Into<PathBuf>) -> Self {".to_string(),
+                tokens: 12,
+                was_transformed: false,
+            },
+            ProcessedDep {
+                module_path: "crate::b::fn::with_crate_root".to_string(),
+                text: "pub fn with_crate_root(mut self, root: impl Into<PathBuf>) -> Self {".to_string(),
+                tokens: 12,
+                was_transformed: false,
+            },
+            ProcessedDep {
+                module_path: "crate::c::fn::unique".to_string(),
+                text: "pub fn unique() -> u32 { 7 }".to_string(),
+                tokens: 8,
+                was_transformed: false,
+            },
+        ];
+        let packed = pack_dependencies(deps, 100, 10);
+        assert_eq!(packed.len(), 2, "identical body must be packed once");
+        assert_eq!(packed[0], "pub fn with_crate_root(mut self, root: impl Into<PathBuf>) -> Self {");
+        assert_eq!(packed[1], "pub fn unique() -> u32 { 7 }");
+    }
+
+    #[test]
+    fn pack_dependencies_respects_budget_and_cap() {
+        let dep = |path: &str, tokens: usize| ProcessedDep {
+            module_path: path.to_string(),
+            text: format!("// {path}"),
+            tokens,
+            was_transformed: false,
+        };
+        // Budget allows one 10-token dep, not two.
+        let packed = pack_dependencies(vec![dep("a", 10), dep("b", 10)], 10, 10);
+        assert_eq!(packed.len(), 1);
+        // Max-dependency cap applies after dedup.
+        let packed = pack_dependencies(
+            (0..8).map(|i| dep(&format!("n{i}"), 1)).collect(),
+            100,
+            3,
+        );
+        assert_eq!(packed.len(), 3);
+    }
 
     #[test]
     fn unicode_cursor_position_maps_to_utf8_offset() {
